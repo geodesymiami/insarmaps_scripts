@@ -1,7 +1,7 @@
 pycurl
 psycopg2
 defusedxml
-h5py<3
+h5py
 numpy
 tippecanoe
 geocoder
