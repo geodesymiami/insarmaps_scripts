@@ -4,3 +4,4 @@ mintpy
 numpy
 psycopg2
 pycurl
+tippecanoe

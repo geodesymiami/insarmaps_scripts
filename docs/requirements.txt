@@ -1,7 +1,0 @@
-pycurl
-psycopg2
-defusedxml
-h5py
-numpy
-tippecanoe
-geocoder
