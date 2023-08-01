@@ -1,3 +1,6 @@
 geocoder
+h5py
+mintpy
+numpy
 psycopg2
 pycurl
