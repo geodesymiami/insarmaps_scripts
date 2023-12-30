@@ -9,5 +9,6 @@ The below install instructions have been tested on ubuntu 22.04. Installing on W
 1. Install tippecanoe: https://github.com/mapbox/tippecanoe
 2. Install gdal: ```sudo apt-get install gdal-bin```
 3. Install Mintpy: https://github.com/insarlab/MintPy/blob/main/docs/installation.md
-4. Run `pip install -r requirements.txt` to install remaining requirements
+4. Run `conda install -file environment.yml` to install non-python code (tippecanoe)
+5. Run `pip install -r requirements.txt` to install remaining requirements
 
