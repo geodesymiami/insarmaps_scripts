@@ -392,9 +392,9 @@ def main():
     os.chdir(os.path.abspath(output_folder))
     cmd = None
     if high_res_mode(attributes):
-        cmd = "tippecanoe *.json -P -l chunk_1 -x d -pf -pk -o " + folder_name + ".mbtiles"
+        cmd = "tippecanoe *.json -P -l chunk_1 -x d -pf -pk -o " + folder_name + ".mbtiles 2> tippecanoe_stderr.log"
     else:
-        cmd = "tippecanoe *.json -P -l chunk_1 -x d -pf -pk -Bg -d9 -D12 -g12 -r0 -o " + folder_name + ".mbtiles"
+        cmd = "tippecanoe *.json -P -l chunk_1 -x d -pf -pk -Bg -d9 -D12 -g12 -r0 -o " + folder_name + ".mbtiles 2> tippecanoe_stderr.log"
 
     print("Now running tippecanoe with command %s" % cmd)
     os.system(cmd)
