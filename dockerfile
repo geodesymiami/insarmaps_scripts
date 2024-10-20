@@ -19,8 +19,9 @@ RUN export PATH=${PATH}:${MINTPY_HOME}/src/mintpy/cli
 RUN export PYTHONPATH=${PYTHONPATH}:${MINTPY_HOME}/src
 
 WORKDIR /home/root
-RUN git clone https://github.com/geodesymiami/insarmaps_scripts.git
+RUN mkdir insarmaps_scripts
 WORKDIR insarmaps_scripts
+COPY . .
 RUN pip3 install --break-system-packages -r requirements.txt
 RUN pip3 install --break-system-packages h5py scipy pyresample
 
