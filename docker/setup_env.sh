@@ -6,3 +6,4 @@ echo 'PYTHONPATH=${PYTHONPATH}:${MINTPY_HOME}/src' >> /home/root/.bash_profile
 source /home/root/.bash_profile
 
 bash
+
