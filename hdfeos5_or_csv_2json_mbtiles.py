@@ -69,6 +69,32 @@ needed_attributes = {
     "scene_footprint", "data_footprint", "downloadUnavcoUrl", "referencePdfUrl", "areaName", "referenceText",
     "REF_LAT", "REF_LON", "CENTER_LINE_UTC", "insarmaps_download_flag", "mintpy.subset.lalo"
 }
+#  FA 4/2025 suggestions:
+# required_attributes_in_data = {
+#     "mission",  
+#     "beam_mode",  
+#     "flight_direction", 
+#     "relative_orbit",  
+#     "processing_method",            # {MiaplPy, MintPy, Sarvey, TRE}
+# }
+# required_attributes_inferred = {    
+#     "data_footprint",               # infer if not given
+#     "data_type",                    # Default: LOS_TIMESERIES
+#     "look_direction",               # Default: R  (L for mission=NISAR)
+#     "start_date",                   # Always infer
+#     "end_date",                     # Always infer
+#     "history",                      # Always infer (processing day's date, i.e. today)
+# }
+# optional_attributes_in_data = {
+#     "REF_LAT", 
+#     "REF_LON", 
+#     "areaName",                     # to be used for search
+#     "beamSwath"                  
+# }
+
+# Renamed_attributes:
+# "data_type"   (formerly "processing_type") 
+# "processing_method" (formerly "post_processing_method")
 
 def serialize_dictionary(dictionary, fileName):
     with open(fileName, "wb") as file:
@@ -518,19 +544,19 @@ def read_from_csv_file(file_name):
 
     # point quality parameters
     dem_error = df['dem_error'].values
+    dem = df['dem'].values
     coherence = df['coherence'].values
     omega = df['omega'].values
     st_consist = df['st_consist'].values
 
     quality_fields = {
-        'dem_error': df['dem_error'].values,
-        'coherence': df['coherence'].values,
-        'omega': df['omega'].values,
-        'st_consist': df['st_consist'].values,
+        'dem_error': dem_error,
+        'elevation': dem + dem_error,
+        'coherence': coherence,
+        'omega': omega,
+        'st_consist': st_consist
     }
-    quality_params = {
-        key: np.full(num_rows * num_cols, np.nan) for key in quality_fields
-    }
+
     quality_grids = {
         key: np.full(num_rows * num_cols, np.nan) for key in quality_fields
     }
@@ -584,6 +610,7 @@ def main():
         # shape = lats.shape
         # quality_params = {
         #     'dem_error': np.zeros(shape, dtype=np.float32),
+        #     'elevation': np.zeros(shape, dtype=np.float32),
         #     'coherence': np.zeros(shape, dtype=np.float32),
         #     'omega': np.zeros(shape, dtype=np.float32),
         #     'st_consist': np.zeros(shape, dtype=np.float32)
