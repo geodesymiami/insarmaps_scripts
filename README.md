@@ -3,7 +3,10 @@
 Collection of scripts to upload and manipulate data on https://insarmaps.miami.edu/
 
 ## Installation
+### Docker
+If you have Docker installed, simply run `./init_docker.sh && ./run_docker.sh` which will create a docker instance where the scripts can be run from.
 
+### Manual install
 The below install instructions have been tested on ubuntu 22.04. Installing on Windows/MacOS/other linux distributions will involve modifying the below commands to the equivalent ones on the target system.
 
 1. Install tippecanoe: https://github.com/mapbox/tippecanoe
