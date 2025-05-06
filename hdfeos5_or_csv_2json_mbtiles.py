@@ -472,11 +472,13 @@ def read_from_csv_file(file_name):
     df = pd.read_csv(file_name)
 
     # dynamically detect latitude/longitude columns
-    lat_candidates = ["Latitude", "Y", "ycoord"]
-    lon_candidates = ["Longitude", "X", "xcoord"]
+    lat_candidates = ["Y_geocorr", "Latitude", "Y", "ycoord"]
+    lon_candidates = ["X_geocorr", "Longitude", "X", "xcoord"]
 
     lat_col = next((col for col in lat_candidates if col in df.columns), None)
     lon_col = next((col for col in lon_candidates if col in df.columns), None)
+
+    print(f"Using columns: lat = {lat_col}, lon = {lon_col}")
 
     if lat_col is None or lon_col is None:
         raise ValueError("Could not find latitude/longitude columns in the CSV. Supported names: 'Latitude', 'Y', 'ycoord' and 'Longitude', 'X', 'xcoord'.")
