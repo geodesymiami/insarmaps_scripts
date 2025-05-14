@@ -162,27 +162,46 @@ def create_json(decimal_dates, timeseries_datasets, dates, json_path, folder_nam
             # get displacement values for all the dates into array for json and string for pgsql
             for datei in dates:
                 displacement = timeseries_datasets[datei][row][col]
-                displacements += (str(displacement) + ",")
-                displacement_values.append(float(displacement))
-            displacements = displacements[:len(displacements) - 1] + '}'
+                if not math.isnan(displacement):
+                    displacement_values.append(float(displacement))
+                else:
+                    displacement_values.append(None)  # JSON-safe null
+                displacements += (str(displacement if not math.isnan(displacement) else 0.0) + ",")
 
             # np array of displacement values, y parameter in linear regression equation
-            y = displacement_values
+            y = [v for v in displacement_values if v is not None]
+            #y = displacement_values
 
             # y = mx + c -> we want m = slope of the linear regression line 
             m, c = np.linalg.lstsq(A, y, rcond=None)[0]
 
-            # Base properties for all inputs
+            # Replace NaN with None for safe JSON encoding
+            safe_properties = {"d": displacement_values, "m": m, "p": point_num}
+            if quality_params:
+                for key in quality_params.keys():
+                    val = quality_params[key][row][col]
+                    if math.isnan(val):  # avoid NaN in JSON
+                        safe_properties[key] = None
+                    else:
+                        safe_properties[key] = val
+
+            # Base properties for all inputs (removing for now)
+            #data = {
+            #    "type": "Feature",
+            #    "geometry": {"type": "Point", "coordinates": [longitude, latitude]},
+            #    "properties": {"d": displacement_values, "m": m, "p": point_num}
+            #}
+
+            # Add quality parameters at this location
+            #if quality_params:   
+            #    for key in quality_params.keys():
+            #        data["properties"][key] = quality_params[key][row][col]
+
             data = {
                 "type": "Feature",
                 "geometry": {"type": "Point", "coordinates": [longitude, latitude]},
-                "properties": {"d": displacement_values, "m": m, "p": point_num}
+                "properties": safe_properties  # Use the cleaned dictionary
             }
-
-            # Add quality parameters at this location
-            if quality_params:   
-                for key in quality_params.keys():
-                    data["properties"][key] = quality_params[key][row][col]
 
             siu_man.append(data)
 
