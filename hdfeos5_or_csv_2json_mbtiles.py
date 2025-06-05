@@ -167,10 +167,15 @@ def create_json(decimal_dates, timeseries_datasets, dates, json_path, folder_nam
                 else:
                     displacement_values.append(None)  # JSON-safe null
                 displacements += (str(displacement if not math.isnan(displacement) else 0.0) + ",")
+            #for datei in dates:
+            #    displacement = timeseries_datasets[datei][row][col]
+            #    displacements += (str(displacement) + ",")
+            #    displacement_values.append(float(displacement))
+            #displacements = displacements[:len(displacements) - 1] + '}'
 
             # np array of displacement values, y parameter in linear regression equation
-            y = [v for v in displacement_values if v is not None]
             #y = displacement_values
+            y = [v for v in displacement_values if v is not None]
 
             # y = mx + c -> we want m = slope of the linear regression line 
             m, c = np.linalg.lstsq(A, y, rcond=None)[0]
@@ -184,8 +189,8 @@ def create_json(decimal_dates, timeseries_datasets, dates, json_path, folder_nam
                         safe_properties[key] = None
                     else:
                         safe_properties[key] = val
-
-            # Base properties for all inputs (removing for now)
+            
+            # Base properties for all inputs
             #data = {
             #    "type": "Feature",
             #    "geometry": {"type": "Point", "coordinates": [longitude, latitude]},
@@ -546,6 +551,18 @@ def read_from_csv_file(file_name):
     attributes["look_direction"] = "R"
     attributes["collection"] = "sarvey"
 
+    # Automatically set data_type based on filename or vertical velocity columns
+    filename_upper = Path(file_name).stem.upper()
+    vert_col_candidates = ['VEL_V', 'V_STDEV_V']
+    has_vertical_columns = any(col in df.columns for col in vert_col_candidates)
+
+    if "VERT" in filename_upper or has_vertical_columns:
+        attributes["data_type"] = "Vertical Displacement"
+    else:
+        attributes["data_type"] = "LOS Displacement"
+
+    print(f"[INFO] Set data_type: {attributes['data_type']}")
+
     # FA 4/2025: attribute to be included in *.csv file as sarvey2csv.py --mission S1 --flight-direction D --relative-orbit 128
     attributes["mission"] = "S1"
     attributes["flight_direction"] = "D"
@@ -564,19 +581,30 @@ def read_from_csv_file(file_name):
     lons_grid = padded_lons.reshape((num_rows, num_cols))
 
     # point quality parameters
-    dem_error = df['dem_error'].values
-    dem = df['dem'].values
-    coherence = df['coherence'].values
-    omega = df['omega'].values
-    st_consist = df['st_consist'].values
+    #dem_error = df['dem_error'].values
+    #dem = df['dem'].values
+    #coherence = df['coherence'].values
+    #omega = df['omega'].values
+    #st_consist = df['st_consist'].values
 
-    quality_fields = {
-        'dem_error': dem_error,
-        'elevation': dem + dem_error,
-        'coherence': coherence,
-        'omega': omega,
-        'st_consist': st_consist
-    }
+    #quality_fields = {
+    #    'dem_error': dem_error,
+    #    'elevation': dem - dem_error,
+    #    'coherence': coherence,
+    #    'omega': omega,
+    #    'st_consist': st_consist
+    #}
+    quality_fields = {}
+    if 'dem_error' in df.columns and 'dem' in df.columns:
+        quality_fields['dem_error'] = df['dem_error'].values
+        quality_fields['elevation'] = df['dem'].values - df['dem_error'].values
+    if 'coherence' in df.columns:
+        quality_fields['coherence'] = df['coherence'].values
+    if 'omega' in df.columns:
+        quality_fields['omega'] = df['omega'].values
+    if 'st_consist' in df.columns:
+        quality_fields['st_consist'] = df['st_consist'].values
+
 
     quality_grids = {
         key: np.full(num_rows * num_cols, np.nan) for key in quality_fields
