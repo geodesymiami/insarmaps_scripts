@@ -597,7 +597,7 @@ def read_from_csv_file(file_name):
     quality_fields = {}
     if 'dem_error' in df.columns and 'dem' in df.columns:
         quality_fields['dem_error'] = df['dem_error'].values
-        quality_fields['elevation'] = df['dem'].values - df['dem_error'].values
+        quality_fields['elevation'] = df['dem_error'].values - df['dem'].values
     if 'coherence' in df.columns:
         quality_fields['coherence'] = df['coherence'].values
     if 'omega' in df.columns:
