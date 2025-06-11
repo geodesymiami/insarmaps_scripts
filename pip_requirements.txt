@@ -1,8 +1,8 @@
 # for installation with pip
 geocoder
+pycurl
 #h5py
 #mintpy
 #numpy
 #psycopg2
-#pycurl
 #tippecanoe    # moved to environment.yml for installation with conda
