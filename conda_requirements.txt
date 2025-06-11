@@ -1,5 +1,4 @@
 # for installation with conda
 tippecanoe
-psycopg2
 mintpy
 h5py
