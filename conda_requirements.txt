@@ -1,4 +1,3 @@
 # for installation with conda
 tippecanoe
 mintpy
-h5py
