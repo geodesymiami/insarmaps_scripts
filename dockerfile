@@ -22,7 +22,7 @@ WORKDIR /home/root
 RUN mkdir insarmaps_scripts
 WORKDIR insarmaps_scripts
 COPY . .
-RUN pip3 install --break-system-packages -r requirements.txt
+RUN pip3 install --break-system-packages -r pip_requirements.txt
 RUN pip3 install --break-system-packages h5py scipy pyresample
 
 WORKDIR /home/root
