@@ -15,6 +15,7 @@ import urllib.request, urllib.parse, urllib.error
 import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from io import BytesIO
+import numpy as np
 
 
 import mintpy.utils.readfile as readfile
@@ -182,15 +183,30 @@ class InsarDatabaseController(object):
         self.cursor.execute(msg)
         self.con.commit()
 
+
+    def convert_np_to_native_types(self, val):
+        if isinstance(val, list):
+            return [self.convert_np_to_native_types(v) for v in val]
+        if isinstance(val, tuple):
+            return tuple(self.convert_np_to_native_types(v) for v in val)
+        if isinstance(val, (np.int64, np.int32)):
+            return int(val)
+        if isinstance(val, (np.float64, np.float32)):
+            return float(val)
+        return val
+
+    def mixed_array_to_str_array(self, conv):
+        return [str(v) for v in conv]
+
     def insert_dataset_into_area_table(self, area, project_name, mid_long, mid_lat,
                                        country, region, chunk_num, attribute_keys,
                                        attribute_values, string_dates_sql, decimal_dates_sql):
         # put dataset into area table
         query = "INSERT INTO area VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
 
-        preparedValues = (area, project_name, mid_long, mid_lat,
+        preparedValues = self.convert_np_to_native_types((area, project_name, mid_long, mid_lat,
                           country, region, chunk_num, attribute_keys,
-                          attribute_values, string_dates_sql, decimal_dates_sql)
+                          self.mixed_array_to_str_array(attribute_values), string_dates_sql, decimal_dates_sql))
         self.cursor.execute(query, preparedValues)
         self.con.commit()
 

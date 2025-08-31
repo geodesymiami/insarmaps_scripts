@@ -228,17 +228,15 @@ def convert_data(attributes, decimal_dates, timeseries_datasets, dates, json_pat
     decimal_dates_sql = decimal_dates_sql[:len(decimal_dates_sql) - 1] + '}'
     # add keys and values to area table. TODO: this will be removed eventually
     # and all attributes will be put in extra_attributes table
-    attribute_keys = '{'
-    attribute_values = '{'
+    attribute_keys = []
+    attribute_values = []
     max_digit = max([len(key) for key in list(needed_attributes)] + [0])
     for k in attributes:
         v = attributes[k]
         if k in needed_attributes:
             print('{k:<{w}}     {v}'.format(k=k, w=max_digit, v=v))
-            attribute_keys += (str(k) + ",")
-            attribute_values += (str(v) + ',')
-    attribute_keys = attribute_keys[:len(attribute_keys)-1] + '}'
-    attribute_values = attribute_values[:len(attribute_values)-1] + '}'
+            attribute_keys.append(k)
+            attribute_values.append(v)
 
     # write out metadata to json file
     insarmapsMetadata["area"] = area
