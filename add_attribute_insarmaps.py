@@ -114,10 +114,10 @@ class InsarDatabaseController(object):
 
         if not self.attribute_exists_for_dataset(dataset, attributekey):
             sql = "INSERT INTO extra_attributes VALUES (%s, %s, %s);"
-            prepared_values = (str(dataset_id), attributekey, attributevalue)
+            prepared_values = self.convert_np_to_native_types((str(dataset_id), attributekey, attributevalue))
         else:
             sql = "UPDATE extra_attributes SET attributevalue = %s WHERE area_id = %s AND attributekey = %s"
-            prepared_values = (attributevalue, str(dataset_id), attributekey)
+            prepared_values = self.convert_np_to_native_types((attributevalue, str(dataset_id), attributekey))
 
         self.cursor.execute(sql, prepared_values)
         self.con.commit()
@@ -133,10 +133,10 @@ class InsarDatabaseController(object):
 
         if not self.plot_attribute_exists_for_dataset(dataset, attributekey):
             sql = "INSERT INTO plot_attributes VALUES (%s, %s, %s);"
-            prepared_values = (str(dataset_id), attributekey, plotAttributeJSON)
+            prepared_values = self.convert_np_to_native_types((str(dataset_id), attributekey, plotAttributeJSON))
         else:
             sql = "UPDATE plot_attributes SET attributevalue = %s WHERE area_id = %s AND attributekey = %s"
-            prepared_values = (plotAttributeJSON, str(dataset_id), attributekey)
+            prepared_values = self.convert_np_to_native_types((plotAttributeJSON, str(dataset_id), attributekey))
 
         self.cursor.execute(sql, prepared_values)
         self.con.commit()
@@ -204,10 +204,10 @@ class InsarDatabaseController(object):
         # put dataset into area table
         query = "INSERT INTO area VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
 
-        preparedValues = self.convert_np_to_native_types((area, project_name, mid_long, mid_lat,
+        prepared_values = self.convert_np_to_native_types((area, project_name, mid_long, mid_lat,
                           country, region, chunk_num, attribute_keys,
                           self.mixed_array_to_str_array(attribute_values), string_dates_sql, decimal_dates_sql))
-        self.cursor.execute(query, preparedValues)
+        self.cursor.execute(query, prepared_values)
         self.con.commit()
 
     def remove_dataset(self, unavco_name):
