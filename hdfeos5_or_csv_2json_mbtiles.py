@@ -7,6 +7,7 @@
 
 
 import os
+import re
 import sys
 import argparse
 import pickle
@@ -375,24 +376,24 @@ Examples:
 def add_dummy_attribute(attributes, is_sarvey_format):
     # add needed attributes to attributes dictionary
     # FA 4/2025: parameters to be added manually: flight_direction, mission,relative_orbit,look_direction
-    attributes['atmos_correct_method'] = None
-    attributes['beam_mode'] = 'IW'
-    attributes['beam_swath'] = 1
-    attributes['post_processing_method'] = 'MintPy'
-    attributes['prf'] = 1717.128973878037
-    attributes['processing_software'] = 'isce'
-    attributes['scene_footprint'] = 'POLYGON((-90.79583946164999 -0.687890034792316,-90.86911230465793 -1.0359825079903804,-91.62407871076888 -0.8729106902243329,-91.55064943686261 -0.5251520401739668,-90.79583946164999 -0.687890034792316))'
-    attributes['wavelength'] = 0.05546576
-    attributes['first_frame'] = 556
-    attributes['last_frame'] = 557
+    attributes.setdefault('atmos_correct_method', None)
+    attributes.setdefault('beam_mode', 'IW')
+    attributes.setdefault('beam_swath', 1)
+    attributes.setdefault('post_processing_method', 'MintPy')
+    attributes.setdefault('prf', 1717.128973878037)
+    attributes.setdefault('processing_software', 'isce')
+    attributes.setdefault('scene_footprint', 'POLYGON((-90.79583946164999 -0.687890034792316,-90.86911230465793 -1.0359825079903804,-91.62407871076888 -0.8729106902243329,-91.55064943686261 -0.5251520401739668,-90.79583946164999 -0.687890034792316))')
+    attributes.setdefault('wavelength', 0.05546576)
+    attributes.setdefault('first_frame', 556)
+    attributes.setdefault('last_frame', 557)
 
     # FA 4/2025: These attributes can also be calcuated from the data
     if not is_sarvey_format:
-        attributes['REF_LAT'] = -0.83355445
-        attributes['REF_LON'] = -91.12596
-        attributes['data_footprint'] = 'POLYGON((-91.19760131835938 -0.7949774265289307,-91.11847686767578 -0.7949774265289307,-91.11847686767578 -0.8754903078079224,-91.19760131835938 -0.8754903078079224,-91.19760131835938 -0.7949774265289307))'
-        attributes['first_date'] = '2016-06-05'
-        attributes['last_date'] = '2016-08-28'
+        attributes.setdefault('REF_LAT', -0.83355445)
+        attributes.setdefault('REF_LON', -91.12596)
+        attributes.setdefault('data_footprint', 'POLYGON((-91.19760131835938 -0.7949774265289307,-91.11847686767578 -0.7949774265289307,-91.11847686767578 -0.8754903078079224,-91.19760131835938 -0.8754903078079224,-91.19760131835938 -0.7949774265289307))')
+        attributes.setdefault('first_date', '2016-06-05')
+        attributes.setdefault('last_date', '2016-08-28')
 
 def add_data_footprint_attribute(attributes, lats, lons):
     """
@@ -489,6 +490,83 @@ def add_calculated_attributes(attributes):
         attributes["last_date"] = sorted_dates[-1]
         attributes["history"] = datetime.now().strftime("%Y-%m-%d")
             
+
+def enrich_attributes_from_slcstack(attributes, csv_path):
+    """
+    Read mission/beam/orbit/etc. from slcStack.h5.
+    Looks for multiple common attribute names and falls back.
+    """
+    try:
+        csv_path = Path(csv_path).resolve()
+        slc_path = csv_path.parent.parent / "inputs" / "slcStack.h5"
+        if slc_path.exists():
+            with h5py.File(slc_path, "r") as f:
+                def _get(attr, default=None):
+                    val = f.attrs.get(attr, default)
+                    if isinstance(val, (bytes, bytearray)):
+                        val = val.decode("utf-8", "ignore")
+                    return val
+
+                mission = _get("mission") or _get("MISSION")
+                platform = _get("platform") or _get("PLATFORM")
+                mission_value = mission or platform
+                if mission_value:
+                    attributes["mission"] = mission_value
+                    #keep explicit platform too if available
+                    if platform:
+                        attributes["platform"] = platform
+
+                #beam_mode
+                bm = _get("beam_mode")
+                if bm:
+                    attributes["beam_mode"] = bm
+
+                #look / flight
+                look = _get("look_direction")
+                if look:
+                    attributes["look_direction"] = look
+                fd = _get("flight_direction")
+                if fd:
+                    attributes["flight_direction"] = fd
+
+                #relative orbit: accept several spellings
+                rel_keys = ["relative_orbit", "orbit", "relativeOrbit", "relativeOrbitNumber"]
+                rel_val = None
+                for rk in rel_keys:
+                    v = _get(rk)
+                    if v is not None:
+                        rel_val = v
+                        break
+                if rel_val is not None:
+                    try:
+                        attributes["relative_orbit"] = int(rel_val)
+                    except Exception:
+                        # leave as-is if non-integer
+                        attributes["relative_orbit"] = rel_val
+        else:
+            print(f"[INFO] slcStack.h5 not found at: {slc_path}")
+
+        #fallback2: infer from standardized CSV filename if still missing OR only defaulted
+        stem = Path(csv_path).stem.upper()
+        m = re.match(r'^(S1|TSX|ALOS|ERS|ENVISAT)_(\d{3})_', stem)
+        if m:
+            file_mission = m.group(1)           # e.g., "TSX"
+            file_rel = int(m.group(2))
+            # If mission was never set or is still the generic default, override it
+            if not attributes.get("mission") or attributes.get("mission", "").upper() == "S1":
+                attributes["mission"] = file_mission.title()  # "TSX" -> "Tsx" (matches your other logs)
+            # Fill relative orbit if missing (yours already set this fine from HDF5)
+            attributes.setdefault("relative_orbit", file_rel)
+            # Sensible default for TSX
+            if attributes.get("mission", "").upper() == "TSX":
+                attributes.setdefault("beam_mode", "SM")
+
+
+    except Exception as e:
+        print(f"[WARN] Could not read slcStack.h5 metadata: {e}")
+
+    return attributes
+
 def read_from_csv_file(file_name):
     # read data from csv file to be done by Emirhan
     # the shared memory shm is confusing. it may also works without but be careful about returning or not returning shm.
@@ -548,7 +626,7 @@ def read_from_csv_file(file_name):
     attributes["LON_ARRAY"] = lons
     attributes["DATE_COLUMNS"] = dates
     attributes["processing_type"] = "LOS_TIMESERIES"
-    attributes["look_direction"] = "R"
+    attributes.setdefault("look_direction", "R")
     attributes["collection"] = "sarvey"
 
     # Automatically set data_type based on filename or vertical velocity columns
@@ -564,9 +642,12 @@ def read_from_csv_file(file_name):
     print(f"[INFO] Set data_type: {attributes['data_type']}")
 
     # FA 4/2025: attribute to be included in *.csv file as sarvey2csv.py --mission S1 --flight-direction D --relative-orbit 128
-    attributes["mission"] = "S1"
-    attributes["flight_direction"] = "D"
-    attributes["relative_orbit"] = 128
+    #replaced hard-coded lines with setdefault
+    attributes.setdefault("mission", "S1")
+    attributes.setdefault("flight_direction", "D")
+    attributes.setdefault("relative_orbit", 128)
+    
+    attributes = enrich_attributes_from_slcstack(attributes, file_name)
 
     add_calculated_attributes(attributes)   # FA 4/2025: need to make work for NOAA-TRE
     add_data_footprint_attribute(attributes, lats, lons)
@@ -580,20 +661,6 @@ def read_from_csv_file(file_name):
     padded_lons[:num_points] = lons
     lons_grid = padded_lons.reshape((num_rows, num_cols))
 
-    # point quality parameters
-    #dem_error = df['dem_error'].values
-    #dem = df['dem'].values
-    #coherence = df['coherence'].values
-    #omega = df['omega'].values
-    #st_consist = df['st_consist'].values
-
-    #quality_fields = {
-    #    'dem_error': dem_error,
-    #    'elevation': dem - dem_error,
-    #    'coherence': coherence,
-    #    'omega': omega,
-    #    'st_consist': st_consist
-    #}
     quality_fields = {}
     if 'dem_error' in df.columns and 'dem' in df.columns:
         quality_fields['dem_error'] = df['dem_error'].values
@@ -614,14 +681,9 @@ def read_from_csv_file(file_name):
         quality_grids[key][:num_points] = values
         quality_grids[key] = quality_grids[key].reshape((num_rows, num_cols))
 
-    # attributes["X_STEP"] = float(np.abs(lons_grid[0, 1] - lons_grid[0, 0]))
-    # attributes["Y_STEP"] = float(np.abs(lats_grid[1, 0] - lats_grid[0, 0]))
-    # attributes["X_FIRST"] = float(lons_grid[0, 0])
-    # attributes["Y_FIRST"] = float(lats_grid[0, 0])
 
     folder_name = os.path.basename(file_name).split(".")[0]
 
-    #shm none
     shm = None
 
     print(" Check: read_from_csv_file output")
