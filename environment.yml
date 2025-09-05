@@ -1,0 +1,16 @@
+name: insarmaps_scripts
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - gdal=3.6*            # Required for Mac
+  - libgdal
+  - mintpy
+  - tippecanoe
+  - libpq
+  - postgresql
+  - psycopg2
+  - pycurl
+# Pip
+  - pip:
+      - geocoder            # insarmaps_sccripts

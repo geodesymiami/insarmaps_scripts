@@ -1,4 +1,0 @@
-# for installation with pip
-geocoder
-pycurl
-psycopg2-binary

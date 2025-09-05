@@ -1,3 +1,0 @@
-# for installation with conda
-tippecanoe
-mintpy
