@@ -35,13 +35,13 @@ from shapely.geometry import MultiPoint
 chunk_num = Value("i", 0)
 # ex: python Converter_unavco.py Alos_SM_73_2980_2990_20070107_20110420.h5
 
-# This script takes a UNAVCO format timeseries h5 file, converts to mbtiles, 
+# This script takes a UNAVCO format timeseries h5 file, converts to mbtiles,
 # and sends to database which allows website to make queries and display data
 # ---------------------------------------------------------------------------------------
 # FUNCTIONS
 # ---------------------------------------------------------------------------------------
 # returns a dictionary of datasets that are stored in memory to speed up h5 read process
-def get_date(date_string): 
+def get_date(date_string):
     year = int(date_string[0:4])
     month = int(date_string[4:6])
     day = int(date_string[6:8])
@@ -72,13 +72,13 @@ needed_attributes = {
 }
 #  FA 4/2025 suggestions:
 # required_attributes_in_data = {
-#     "mission",  
-#     "beam_mode",  
-#     "flight_direction", 
-#     "relative_orbit",  
+#     "mission",
+#     "beam_mode",
+#     "flight_direction",
+#     "relative_orbit",
 #     "processing_method",            # {MiaplPy, MintPy, Sarvey, TRE}
 # }
-# required_attributes_inferred = {    
+# required_attributes_inferred = {
 #     "data_footprint",               # infer if not given
 #     "data_type",                    # Default: LOS_TIMESERIES
 #     "look_direction",               # Default: R  (L for mission=NISAR)
@@ -87,14 +87,14 @@ needed_attributes = {
 #     "history",                      # Always infer (processing day's date, i.e. today)
 # }
 # optional_attributes_in_data = {
-#     "REF_LAT", 
-#     "REF_LON", 
+#     "REF_LAT",
+#     "REF_LON",
 #     "areaName",                     # to be used for search
-#     "beamSwath"                  
+#     "beamSwath"
 # }
 
 # Renamed_attributes:
-# "data_type"   (formerly "processing_type") 
+# "data_type"   (formerly "processing_type")
 # "processing_method" (formerly "post_processing_method")
 
 def serialize_dictionary(dictionary, fileName):
@@ -157,7 +157,7 @@ def create_json(decimal_dates, timeseries_datasets, dates, json_path, folder_nam
 
         longitude = float(lons[row][col])
         latitude = float(lats[row][col])
-        displacement = float(value) 
+        displacement = float(value)
         # if value is not equal to naN, create a new json point object and append to siu_man array
         if not math.isnan(displacement):
             # get displacement values for all the dates into array for json and string for pgsql
@@ -178,7 +178,7 @@ def create_json(decimal_dates, timeseries_datasets, dates, json_path, folder_nam
             #y = displacement_values
             y = [v for v in displacement_values if v is not None]
 
-            # y = mx + c -> we want m = slope of the linear regression line 
+            # y = mx + c -> we want m = slope of the linear regression line
             m, c = np.linalg.lstsq(A, y, rcond=None)[0]
 
             # Replace NaN with None for safe JSON encoding
@@ -190,7 +190,7 @@ def create_json(decimal_dates, timeseries_datasets, dates, json_path, folder_nam
                         safe_properties[key] = None
                     else:
                         safe_properties[key] = val
-            
+
             # Base properties for all inputs
             #data = {
             #    "type": "Feature",
@@ -199,7 +199,7 @@ def create_json(decimal_dates, timeseries_datasets, dates, json_path, folder_nam
             #}
 
             # Add quality parameters at this location
-            #if quality_params:   
+            #if quality_params:
             #    for key in quality_params.keys():
             #        data["properties"][key] = quality_params[key][row][col]
 
@@ -221,7 +221,7 @@ def create_json(decimal_dates, timeseries_datasets, dates, json_path, folder_nam
         with chunk_num.get_lock():
             chunk_num_val = chunk_num.value
             chunk_num.value += 1
-  
+
         make_json_file(chunk_num_val, siu_man, dates, json_path, folder_name)
 
         siu_man = []
@@ -262,7 +262,7 @@ def convert_data(attributes, decimal_dates, timeseries_datasets, dates, json_pat
     insarmapsMetadata = {}
     # calculate mid lat and long of dataset - then use google python lib to get country
     # technically don't need the else since we always use lats and lons arrays now
-    
+
     #below part removed for now ,csv
     #if high_res_mode(attributes):
     #    num_rows, num_columns = lats.shape
@@ -322,7 +322,7 @@ def convert_data(attributes, decimal_dates, timeseries_datasets, dates, json_pat
     insarmapsMetadata["decimal_dates_sql"] = decimal_dates_sql
     insarmapsMetadata["attributes"] = attributes
     insarmapsMetadata["needed_attributes"] = needed_attributes
-    metadataFilePath = json_path + "/metadata.pickle" 
+    metadataFilePath = json_path + "/metadata.pickle"
     serialize_dictionary(insarmapsMetadata, metadataFilePath)
     return
 
@@ -415,7 +415,7 @@ def add_data_footprint_attribute(attributes, lats, lons):
         f"{max_lon} {min_lat}))"
     )
     print("data_footprint: ", polygon)
-   
+
     attributes['data_footprint'] = polygon
     attributes["scene_footprint"] = polygon
 
@@ -426,7 +426,7 @@ def read_from_hdfeos5_file(file_name):
     path_name_and_extension = os.path.basename(file_name).split(".")
     path_name = path_name_and_extension[0]
 
-    # use h5py to open specified group(s) in the h5 file 
+    # use h5py to open specified group(s) in the h5 file
     # then read datasets from h5 file into memory for faster reading of data
     he_obj = HDFEOS(file_name)
     he_obj.open(print_msg=False)
@@ -486,7 +486,7 @@ def add_calculated_attributes(attributes):
         attributes["first_date"] = sorted_dates[0]
         attributes["last_date"] = sorted_dates[-1]
         attributes["history"] = datetime.now().strftime("%Y-%m-%d")
-            
+
 
 def enrich_attributes_from_slcstack(attributes, csv_path):
     """
@@ -496,6 +496,7 @@ def enrich_attributes_from_slcstack(attributes, csv_path):
     try:
         csv_path = Path(csv_path).resolve()
         slc_path = csv_path.parent.parent / "inputs" / "slcStack.h5"
+        # Note FA: Can't we just read the metadata from slcStack instead of complicated processing?
         if slc_path.exists():
             with h5py.File(slc_path, "r") as f:
                 def _get(attr, default=None):
@@ -602,7 +603,7 @@ def read_from_csv_file(file_name):
     # 3D time-series array (time, y, x)
     num_points = len(df)
     num_dates = len(time_cols)
-    
+
     # reshape to 3D
     num_rows = int(np.sqrt(num_points))
     num_cols = int(np.ceil(num_points / num_rows))
@@ -640,16 +641,18 @@ def read_from_csv_file(file_name):
 
     # FA 4/2025: attribute to be included in *.csv file as sarvey2csv.py --mission S1 --flight-direction D --relative-orbit 128
     #replaced hard-coded lines with setdefault
-    attributes.setdefault("mission", "S1")
-    attributes.setdefault("flight_direction", "D")
-    attributes.setdefault("relative_orbit", 128)
-    
+    #attributes.setdefault("mission", "S1")
+    #attributes.setdefault("flight_direction", "D")
+    #attributes.setdefault("relative_orbit", 128)
+    attributes.setdefault("PLATFORM", "S1")
+    attributes.setdefault("MISSION", "S1")
+
     attributes = enrich_attributes_from_slcstack(attributes, file_name)
 
     add_calculated_attributes(attributes)   # FA 4/2025: need to make work for NOAA-TRE
     add_data_footprint_attribute(attributes, lats, lons)
     add_dummy_attribute(attributes, is_sarvey_format)  # Remove once needed_attributes have been reduced. FA 4/2025: this shoulkd not depend on sarvey or NOAA
-    
+
     padded_lats = np.full(num_cols * num_rows, np.nan)
     padded_lats [:num_points] = lats
     lats_grid = padded_lats.reshape((num_rows, num_cols))
@@ -677,7 +680,6 @@ def read_from_csv_file(file_name):
     for key, values in quality_fields.items():
         quality_grids[key][:num_points] = values
         quality_grids[key] = quality_grids[key].reshape((num_rows, num_cols))
-
 
     folder_name = os.path.basename(file_name).split(".")[0]
 
@@ -710,7 +712,7 @@ def main():
 
     # start clock to track how long conversion process takes
     start_time = time.perf_counter()
-    
+
     if file_path.suffix.lower() == ".he5":
         attributes, decimal_dates, timeseries_datasets, dates, folder_name, lats, lons, shm = read_from_hdfeos5_file(file_name)
         quality_params = None
@@ -726,7 +728,7 @@ def main():
     elif file_path.suffix.lower() == ".csv":
         attributes, decimal_dates, timeseries_datasets, dates, folder_name, lats, lons, shm, quality_params = read_from_csv_file(file_name)
     else:
-        raise FileNotFoundError(f"The file '{file_path}' does not exist or has not .he5 or .csv as extension.")   
+        raise FileNotFoundError(f"The file '{file_path}' does not exist or has not .he5 or .csv as extension.")
 
     # read and convert the datasets, then write them into json files and insert into database
     convert_data(attributes, decimal_dates, timeseries_datasets, dates, output_folder, folder_name, lats, lons, quality_params, parseArgs.num_workers)
