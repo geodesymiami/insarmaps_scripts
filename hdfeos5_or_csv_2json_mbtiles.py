@@ -649,6 +649,22 @@ def read_from_csv_file(file_name):
 
     attributes = enrich_attributes_from_slcstack(attributes, file_name)
 
+    #normalize mission/platform for InsarMaps (expects lower-case)
+    if attributes.get('mission') in (None, 'None', '', 'null'):
+        if attributes.get('MISSION'):
+            attributes['mission'] = attributes['MISSION']
+
+    if attributes.get('platform') in (None, 'None', '', 'null'):
+        if attributes.get('PLATFORM'):
+            attributes['platform'] = attributes['PLATFORM']
+
+    # make relative_orbit safe (turn into int --ifpossible)
+    if 'relative_orbit' in attributes:
+        try:
+            attributes['relative_orbit'] = int(attributes['relative_orbit'])
+        except Exception:
+            pass
+
     add_calculated_attributes(attributes)   # FA 4/2025: need to make work for NOAA-TRE
     add_data_footprint_attribute(attributes, lats, lons)
     add_dummy_attribute(attributes, is_sarvey_format)  # Remove once needed_attributes have been reduced. FA 4/2025: this shoulkd not depend on sarvey or NOAA
