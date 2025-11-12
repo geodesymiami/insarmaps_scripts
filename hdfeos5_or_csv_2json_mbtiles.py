@@ -144,8 +144,8 @@ def create_json(decimal_dates, timeseries_datasets, dates, json_path, folder_nam
     displacements = '{'
     # np array of decimal dates, x parameter in linear regression equation
     x = decimal_dates
-    A = np.vstack([x, np.ones(len(x))]).T
-    y = []
+    #A = np.vstack([x, np.ones(len(x))]).T
+    #y = []
     point_num = work_idxs[0]
     # iterate through h5 file timeseries
     for (row, col), value in np.ndenumerate(timeseries_datasets[dates[0]]):
@@ -174,19 +174,34 @@ def create_json(decimal_dates, timeseries_datasets, dates, json_path, folder_nam
             #    displacement_values.append(float(displacement))
             #displacements = displacements[:len(displacements) - 1] + '}'
 
-            # np array of displacement values, y parameter in linear regression equation
-            #y = displacement_values
-            y = [v for v in displacement_values if v is not None]
+            # Build x/y only where y is present
+            x_arr = np.asarray(x)
+            mask = np.array([v is not None for v in displacement_values], dtype=bool)
+            x_used = x_arr[mask]
+            y = np.asarray(displacement_values, dtype=float)[mask]
 
-            # y = mx + c -> we want m = slope of the linear regression line
-            m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+            # Linear regression: y = m*x + c (guard against all-missing / single point)
+            if y.size >= 2:
+                A = np.vstack([x_used, np.ones(x_used.size)]).T
+                m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+            else:
+                m = float('nan')
 
             # Replace NaN with None for safe JSON encoding
             safe_properties = {"d": displacement_values, "m": m, "p": point_num}
             if quality_params:
                 for key in quality_params.keys():
                     val = quality_params[key][row][col]
-                    if math.isnan(val):  # avoid NaN in JSON
+
+                    # For point_ID: include only if present (no None); cast to int
+                    if key == "point_ID":
+                        if val is None or ((isinstance(val, float) and math.isnan(val)) or not math.isfinite(val)):
+                            continue  # don't add point_ID at all
+                        safe_properties[key] = int(val)
+                        continue
+
+                    # Existing behavior for other quality fields
+                    if val is None or (isinstance(val, float) and math.isnan(val)):
                         safe_properties[key] = None
                     else:
                         safe_properties[key] = val
@@ -571,6 +586,15 @@ def read_from_csv_file(file_name):
 
     df = pd.read_csv(file_name)
 
+    # Normalize headers (trim spaces)
+    df.columns = [c.strip() for c in df.columns]
+
+    # detect point_id (any case) and normalize to a new column 'point_ID'
+    pid_col = next((c for c in df.columns if c.lower() == "point_id"), None)
+    if pid_col is not None:
+        df["point_ID"] = pd.to_numeric(df[pid_col], errors="coerce")  # float with NaN is fine
+        print(f"[INFO] Detected point_ID column: {pid_col} (non-null={df['point_ID'].notna().sum()})")
+
     # dynamically detect latitude/longitude columns
     lat_candidates = ["Y_geocorr", "Latitude", "Y", "ycoord"]
     lon_candidates = ["X_geocorr", "Longitude", "X", "xcoord"]
@@ -687,6 +711,10 @@ def read_from_csv_file(file_name):
         quality_fields['omega'] = df['omega'].values
     if 'st_consist' in df.columns:
         quality_fields['st_consist'] = df['st_consist'].values
+
+    # Add point_ID if present (no default / None creation)
+    if 'point_ID' in df.columns:
+        quality_fields['point_ID'] = df['point_ID'].to_numpy(dtype=float)  # keeping as 1-D vector 
 
 
     quality_grids = {
