@@ -70,34 +70,10 @@ needed_attributes = {
     "scene_footprint", "data_footprint", "downloadUnavcoUrl", "referencePdfUrl", "areaName", "referenceText",
     "REF_LAT", "REF_LON", "CENTER_LINE_UTC", "insarmaps_download_flag", "mintpy.subset.lalo"
 }
-#  FA 4/2025 suggestions:
-# required_attributes_in_data = {
-#     "mission",
-#     "beam_mode",
-#     "flight_direction",
-#     "relative_orbit",
-#     "processing_method",            # {MiaplPy, MintPy, Sarvey, TRE}
-# }
-# required_attributes_inferred = {
-#     "data_footprint",               # infer if not given
-#     "data_type",                    # Default: LOS_TIMESERIES
-#     "look_direction",               # Default: R  (L for mission=NISAR)
-#     "start_date",                   # Always infer
-#     "end_date",                     # Always infer
-#     "history",                      # Always infer (processing day's date, i.e. today)
-# }
-# optional_attributes_in_data = {
-#     "REF_LAT",
-#     "REF_LON",
-#     "areaName",                     # to be used for search
-#     "beamSwath"
-# }
-
-# Renamed_attributes:
-# "data_type"   (formerly "processing_type")
-# "processing_method" (formerly "post_processing_method")
 
 def serialize_dictionary(dictionary, fileName):
+    """Serialize a dictionary to a pickle file."""
+
     with open(fileName, "wb") as file:
         pickle.dump(dictionary, file, protocol=pickle.HIGHEST_PROTOCOL)
     return
@@ -113,6 +89,24 @@ def get_attribute_or_remove_from_needed(needed_attributes, attributes, attribute
     return val
 
 def generate_worker_args(decimal_dates, timeseries_datasets, dates, json_path, folder_name, chunk_size, lats, lons, num_columns, num_rows, quality_params=None):
+    """
+    Build argument tuples for worker processes that create JSON chunks.
+
+    Each tuple contains:
+    (
+        decimal_dates,
+        timeseries_datasets,
+        dates,
+        json_path,
+        folder_name,
+        (start_index, end_index),  # inclusive indices in flattened grid
+        num_columns,
+        num_rows,
+        lats,
+        lons,
+        quality_params,
+    )
+    """
     num_points = num_columns * num_rows
 
     worker_args = []
@@ -137,109 +131,108 @@ def generate_worker_args(decimal_dates, timeseries_datasets, dates, json_path, f
     return worker_args
 
 def create_json(decimal_dates, timeseries_datasets, dates, json_path, folder_name, work_idxs, num_columns, num_rows, lats=None, lons=None, quality_params=None):
+    """
+    Create GeoJSON point features for a subset of the grid defined by work_idxs
+    and write them to a chunk_<N>.json file.
+    """
+    
     global chunk_num
+
+    # List to store GeoJSON Feature objects for this chunk
     # create a siu_man array to store json point objects
     siu_man = []
-    displacement_values = []
-    displacements = '{'
-    # np array of decimal dates, x parameter in linear regression equation
-    x = decimal_dates
-    #A = np.vstack([x, np.ones(len(x))]).T
-    #y = []
-    point_num = work_idxs[0]
-    # iterate through h5 file timeseries
-    for (row, col), value in np.ndenumerate(timeseries_datasets[dates[0]]):
+    # Decimal dates as a numpy array (x in regression)
+    x_arr = np.asarray(decimal_dates, dtype=float)
+
+    start_idx, end_idx = work_idxs
+    point_num = start_idx
+
+    # Use the first date slice to determine which points exist in this chunk
+    first_slice = timeseries_datasets[dates[0]]
+
+    for (row, col), first_value in np.ndenumerate(first_slice):
         cur_iter_point_num = row * num_columns + col
-        if cur_iter_point_num < work_idxs[0]:
+
+        if cur_iter_point_num < start_idx:
             continue
-        elif cur_iter_point_num > work_idxs[1]:
+        if cur_iter_point_num > end_idx:
             break
+
+        displacement0 = float(first_value)
+
+        # Skip points where the first date value is NaN
+        if math.isnan(displacement0):
+            continue
 
         longitude = float(lons[row][col])
         latitude = float(lats[row][col])
-        displacement = float(value)
-        # if value is not equal to naN, create a new json point object and append to siu_man array
-        if not math.isnan(displacement):
-            # get displacement values for all the dates into array for json and string for pgsql
-            for datei in dates:
-                displacement = timeseries_datasets[datei][row][col]
-                if not math.isnan(displacement):
-                    displacement_values.append(float(displacement))
-                else:
-                    displacement_values.append(None)  # JSON-safe null
-                displacements += (str(displacement if not math.isnan(displacement) else 0.0) + ",")
-            #for datei in dates:
-            #    displacement = timeseries_datasets[datei][row][col]
-            #    displacements += (str(displacement) + ",")
-            #    displacement_values.append(float(displacement))
-            #displacements = displacements[:len(displacements) - 1] + '}'
 
-            # Build x/y only where y is present
-            x_arr = np.asarray(x)
-            mask = np.array([v is not None for v in displacement_values], dtype=bool)
-            x_used = x_arr[mask]
-            y = np.asarray(displacement_values, dtype=float)[mask]
-
-            # Linear regression: y = m*x + c (guard against all-missing / single point)
-            if y.size >= 2:
-                A = np.vstack([x_used, np.ones(x_used.size)]).T
-                m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+        # Collect displacement values across all dates for this point
+        displacement_values = []
+        for datei in dates:
+            val = timeseries_datasets[datei][row][col]
+            if not math.isnan(val):
+                displacement_values.append(float(val))
             else:
-                m = float('nan')
+                # Use None to produce JSON null for missing values
+                displacement_values.append(None)
 
-            # Replace NaN with None for safe JSON encoding
-            safe_properties = {"d": displacement_values, "m": m, "p": point_num}
-            if quality_params:
-                for key in quality_params.keys():
-                    val = quality_params[key][row][col]
+        # Build x/y arrays only where y is present
+        mask = np.array([v is not None for v in displacement_values], dtype=bool)
+        x_used = x_arr[mask]
+        y = np.asarray(displacement_values, dtype=float)[mask]
 
-                    # For point_ID: include only if present (no None); cast to int
-                    if key == "point_ID":
-                        if val is None or ((isinstance(val, float) and math.isnan(val)) or not math.isfinite(val)):
-                            continue  # don't add point_ID at all
-                        safe_properties[key] = int(val)
+        # Linear regression: y = m*x + c, only if we have at least 2 valid points
+        if y.size >= 2:
+            A = np.vstack([x_used, np.ones(x_used.size)]).T
+            m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+        else:
+            m = float("nan")
+
+        # Base properties for all inputs
+        safe_properties = {"d": displacement_values, "m": m, "p": point_num}
+
+        # Add quality parameters at this location, if provided
+        if quality_params:
+            for key, arr in quality_params.items():
+                val = arr[row][col]
+
+                # For point_ID: include only if present (no None) and finite; cast to int
+                if key == "point_ID":
+                    if (
+                        val is None
+                        or (
+                            isinstance(val, float)
+                            and (math.isnan(val) or not math.isfinite(val))
+                        )
+                    ):
                         continue
+                    safe_properties[key] = int(val)
+                    continue
 
-                    # Existing behavior for other quality fields
-                    if val is None or (isinstance(val, float) and math.isnan(val)):
-                        safe_properties[key] = None
-                    else:
-                        safe_properties[key] = val
+                # Existing behavior for other quality fields
+                if val is None or (isinstance(val, float) and math.isnan(val)):
+                    safe_properties[key] = None
+                else:
+                    safe_properties[key] = val
 
-            # Base properties for all inputs
-            #data = {
-            #    "type": "Feature",
-            #    "geometry": {"type": "Point", "coordinates": [longitude, latitude]},
-            #    "properties": {"d": displacement_values, "m": m, "p": point_num}
-            #}
+        # Build GeoJSON feature
+        data = {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [longitude, latitude]},
+            "properties": safe_properties,
+        }
 
-            # Add quality parameters at this location
-            #if quality_params:
-            #    for key in quality_params.keys():
-            #        data["properties"][key] = quality_params[key][row][col]
+        siu_man.append(data)
+        point_num += 1
 
-            data = {
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [longitude, latitude]},
-                "properties": safe_properties  # Use the cleaned dictionary
-            }
-
-            siu_man.append(data)
-
-            # clear displacement array for json and the other string for dictionary, for next point
-            displacement_values = []
-            displacements = '{'
-            point_num += 1
-
+    # Write out chunk if any features were created
     if len(siu_man) > 0:
-        chunk_num_val = -1
         with chunk_num.get_lock():
             chunk_num_val = chunk_num.value
             chunk_num.value += 1
 
         make_json_file(chunk_num_val, siu_man, dates, json_path, folder_name)
-
-        siu_man = []
 
 # ---------------------------------------------------------------------------------------
 # convert h5 file to json and upload it. folder_name == unavco_name
@@ -247,13 +240,14 @@ def convert_data(attributes, decimal_dates, timeseries_datasets, dates, json_pat
 
     project_name = attributes["PROJECT_NAME"]
     region = region_name_from_project_name(project_name)
-    # get the attributes for calculating latitude and longitude
-    x_step, y_step, x_first, y_first = 0, 0, 0, 0
+
+    # Get attributes for calculating latitude and longitude (legacy; midpoint now uses lats/lons)
+    x_step = y_step = x_first = y_first = 0.0
     if high_res_mode(attributes):
-        needed_attributes.remove("X_STEP")
-        needed_attributes.remove("Y_STEP")
-        needed_attributes.remove("X_FIRST")
-        needed_attributes.remove("Y_FIRST")
+        # In high-res mode, these keys are not meaningful; remove them from needed_attributes
+        for key in ("X_STEP", "Y_STEP", "X_FIRST", "Y_FIRST"):
+            if key in needed_attributes:
+                needed_attributes.remove(key)
     else:
         x_step = float(attributes["X_STEP"])
         y_step = float(attributes["Y_STEP"])
@@ -262,68 +256,68 @@ def convert_data(attributes, decimal_dates, timeseries_datasets, dates, json_pat
 
     num_columns = int(attributes["WIDTH"])
     num_rows = int(attributes["LENGTH"])
-    print("columns: %d" % num_columns)
-    print("rows: %d" % num_rows)
+    print(f"columns: {num_columns}")
+    print(f"rows: {num_rows}")
+
+    # If lats/lons are not provided (HDFEOS5), compute them from attributes
     if lats is None and lons is None:
         lats, lons = ut.get_lat_lon(attributes, dimension=1)
 
+    # ----------------------------------------------------------------------
+    # Create JSON chunks in parallel
+    # ----------------------------------------------------------------------
     CHUNK_SIZE = 20000
+
+    worker_args = generate_worker_args(decimal_dates, timeseries_datasets, dates, json_path, folder_name, CHUNK_SIZE, lats, lons, num_columns, num_rows, quality_params)
+
     process_pool = Pool(num_workers)
-    process_pool.starmap(create_json, generate_worker_args(decimal_dates, timeseries_datasets, dates, json_path, folder_name, CHUNK_SIZE, lats, lons, num_columns, num_rows, quality_params))
+    process_pool.starmap(create_json, worker_args)
     process_pool.close()
 
     # dictionary to contain metadata needed by db to be written to a file
     # and then be read by json_mbtiles2insarmaps.py
-    insarmapsMetadata = {}
     # calculate mid lat and long of dataset - then use google python lib to get country
     # technically don't need the else since we always use lats and lons arrays now
+    # ----------------------------------------------------------------------
+    # Build metadata for Insarmaps
+    # ----------------------------------------------------------------------
+    insarmapsMetadata = {}
 
-    #below part removed for now ,csv
-    #if high_res_mode(attributes):
-    #    num_rows, num_columns = lats.shape
-    #    mid_long = float(lons[num_rows // 2][num_columns // 2])
-    #    mid_lat = float(lats[num_rows // 2][num_columns // 2])
-    #else:
-    #    mid_long = x_first + ((num_columns/2) * x_step)
-    #    mid_lat = y_first + ((num_rows/2) * y_step)
+    # Midpoint: use mean of lat/lon arrays (works for both HDFEOS5 and CSV)
     mid_lat = float(np.nanmean(lats))
     mid_long = float(np.nanmean(lons))
 
+    # Reverse geocode to get country name
     country = "None"
     try:
-        g = geocoder.google([mid_lat,mid_long], method='reverse', timeout=60.0)
+        g = geocoder.google([mid_lat, mid_long], method="reverse", timeout=60.0)
         country = str(g.country_long)
     except Exception:
         sys.stderr.write("timeout reverse geocoding country name")
 
     area = folder_name
 
-    # for some reason pgsql only takes {} not [] - format date arrays and attributes to be inserted to pgsql
-    string_dates_sql = '{'
-    for k in dates:
-        string_dates_sql += (str(k) + ",")
-    string_dates_sql = string_dates_sql[:len(string_dates_sql) - 1] + '}'
+    # Postgres-style date arrays: {d1,d2,...}
+    string_dates_sql = "{" + ",".join(str(k) for k in dates) + "}"
+    decimal_dates_sql = "{" + ",".join(str(d) for d in decimal_dates) + "}"
 
-    decimal_dates_sql = '{'
-    for d in decimal_dates:
-        decimal_dates_sql += (str(d) + ",")
-    decimal_dates_sql = decimal_dates_sql[:len(decimal_dates_sql) - 1] + '}'
-    # add keys and values to area table. TODO: this will be removed eventually
-    # and all attributes will be put in extra_attributes table
+    # Add keys and values to area table.
     attribute_keys = []
     attribute_values = []
     max_digit = max([len(key) for key in list(needed_attributes)] + [0])
-    for k in attributes:
-        v = attributes[k]
+
+    for k, v in attributes.items():
         if k in needed_attributes:
-            print('{k:<{w}}     {v}'.format(k=k, w=max_digit, v=v))
+            # Print in aligned format
+            print(f"{k:<{max_digit}}     {v}")
             attribute_keys.append(k)
             attribute_values.append(v)
-    # force 'elevation' to show up in popup
+
+    # Force 'elevation' to show up in popup
     attribute_keys.append("dem")
     attribute_values.append("1")
 
-    # write out metadata to json file
+    # Populate metadata dictionary
     insarmapsMetadata["area"] = area
     insarmapsMetadata["project_name"] = project_name
     insarmapsMetadata["mid_long"] = mid_long
@@ -337,10 +331,10 @@ def convert_data(attributes, decimal_dates, timeseries_datasets, dates, json_pat
     insarmapsMetadata["decimal_dates_sql"] = decimal_dates_sql
     insarmapsMetadata["attributes"] = attributes
     insarmapsMetadata["needed_attributes"] = needed_attributes
+
     metadataFilePath = json_path + "/metadata.pickle"
     serialize_dictionary(insarmapsMetadata, metadataFilePath)
     return
-
 
 # ---------------------------------------------------------------------------------------
 # create a json file out of siu man array
@@ -368,60 +362,118 @@ def high_res_mode(attributes):
     return high_res
 
 # ---------------------------------------------------------------------------------------
-def build_parser():
+def build_parser() -> argparse.ArgumentParser:
+    """
+    Build the command-line argument parser for hdfeos5_or_csv_2json_mbtiles.py.
+    """
     example_text = """\
-This program will create temporary json chunk files which, when concatenated together, comprise the whole dataset. Tippecanoe is used for concatenating these chunk files into the mbtiles file.
+This program will create temporary JSON chunk files which, when concatenated
+together, comprise the whole dataset. Tippecanoe is used to convert these
+JSON chunks into an MBTiles file.
 
 Examples:
   hdfeos5_or_csv_2json_mbtiles.py mintpy/S1_IW1_128_0596_0597_20160605_XXXXXXXX_S00887_S00783_W091208_W091105.he5 mintpy/JSON --num-workers 3
   hdfeos5_or_csv_2json_mbtiles.py sarvey_test.csv ./JSON
   hdfeos5_or_csv_2json_mbtiles.py NOAA_SNT_A_VERT_10_50m.csv ./JSON_NOAA
-  """
-    parser = argparse.ArgumentParser(description="Convert a hdfeos5 or CSV file for ingestion into insarmaps.", epilog=example_text, formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("--num-workers", help="Number of simultaneous processes to run for ingest.", required=False, default=1, type=int)
+    """
+
+    parser = argparse.ArgumentParser(
+        description="Convert an HDFEOS5 (.he5) or CSV file for ingestion into Insarmaps.",
+        epilog=example_text,
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    
+    parser.add_argument(
+        "--num-workers",
+        help="Number of simultaneous processes to run for JSON creation.",
+        required=False,
+        default=1,
+        type=int,
+    )
+
     required = parser.add_argument_group("required arguments")
-    required.add_argument("file", help="unavco file to ingest")
-    required.add_argument("outputDir", help="directory to place json files and mbtiles file")
+
+    required.add_argument(
+        "file",
+        help="(unavco) Input file to ingest (.he5 or .csv).",
+    )
+
+    required.add_argument(
+        "outputDir",
+        help="Directory to place JSON chunk files and MBTiles output.",
+    )
 
     return parser
 
-def add_dummy_attribute(attributes, is_sarvey_format):
-    # add needed attributes to attributes dictionary
-    # FA 4/2025: parameters to be added manually: flight_direction, mission,relative_orbit,look_direction
-    attributes.setdefault('atmos_correct_method', None)
-    attributes.setdefault('beam_mode', 'IW')
-    attributes.setdefault('beam_swath', 1)
-    attributes.setdefault('post_processing_method', 'MintPy')
-    attributes.setdefault('prf', 1717.128973878037)
-    attributes.setdefault('processing_software', 'isce')
-    attributes.setdefault('scene_footprint', 'POLYGON((-90.79583946164999 -0.687890034792316,-90.86911230465793 -1.0359825079903804,-91.62407871076888 -0.8729106902243329,-91.55064943686261 -0.5251520401739668,-90.79583946164999 -0.687890034792316))')
-    attributes.setdefault('wavelength', 0.05546576)
-    attributes.setdefault('first_frame', 556)
-    attributes.setdefault('last_frame', 557)
+def add_dummy_attribute(attributes: dict, is_sarvey_format: bool) -> None:
+    """
+    Fill in missing attributes with hard-coded defaults to satisfy Insarmaps
+    expectations, mainly for CSV imports.
 
-    # FA 4/2025: These attributes can also be calcuated from the data
+    Notes
+    -----
+    - This is a temporary compatibility layer until needed_attributes is reduced
+      or fully driven by real metadata.
+    - For SARvey-style CSV (is_sarvey_format=True), we only set processing-related
+      defaults. For other formats, we also set REF_LAT / REF_LON, data_footprint,
+      first_date, and last_date if they are missing.
+    """
+
+    # Processing / acquisition defaults
+    attributes.setdefault("atmos_correct_method", None)
+    attributes.setdefault("beam_mode", "IW")
+    attributes.setdefault("beam_swath", 1)
+    attributes.setdefault("post_processing_method", "MintPy")
+    attributes.setdefault("prf", 1717.128973878037)
+    attributes.setdefault("processing_software", "isce")
+    attributes.setdefault(
+                        "scene_footprint",
+                        "POLYGON((-90.79583946164999 -0.687890034792316,"
+                                "-90.86911230465793 -1.0359825079903804,"
+                                "-91.62407871076888 -0.8729106902243329,"
+                                "-91.55064943686261 -0.5251520401739668,"
+                                "-90.79583946164999 -0.687890034792316))",
+                        )
+    attributes.setdefault("wavelength", 0.05546576)
+    attributes.setdefault("first_frame", 556)
+    attributes.setdefault("last_frame", 557)
+
+    # For non-SARvey formats, provide hard-coded spatial/time defaults if they are missing.
     if not is_sarvey_format:
-        attributes.setdefault('REF_LAT', -0.83355445)
-        attributes.setdefault('REF_LON', -91.12596)
-        attributes.setdefault('data_footprint', 'POLYGON((-91.19760131835938 -0.7949774265289307,-91.11847686767578 -0.7949774265289307,-91.11847686767578 -0.8754903078079224,-91.19760131835938 -0.8754903078079224,-91.19760131835938 -0.7949774265289307))')
-        attributes.setdefault('first_date', '2016-06-05')
-        attributes.setdefault('last_date', '2016-08-28')
+        attributes.setdefault("REF_LAT", -0.83355445)
+        attributes.setdefault("REF_LON", -91.12596)
+        attributes.setdefault(
+                            "data_footprint",
+                            "POLYGON((-91.19760131835938 -0.7949774265289307,"
+                                    "-91.11847686767578 -0.7949774265289307,"
+                                    "-91.11847686767578 -0.8754903078079224,"
+                                    "-91.19760131835938 -0.8754903078079224,"
+                                    "-91.19760131835938 -0.7949774265289307))",
+                            )
+        attributes.setdefault("first_date", "2016-06-05")
+        attributes.setdefault("last_date", "2016-08-28")
 
-def add_data_footprint_attribute(attributes, lats, lons):
+def add_data_footprint_attribute(attributes: dict, lats: np.ndarray, lons: np.ndarray) -> None:
     """
-    Adds a 'data_footprint' attribute to the attributes dictionary based on min/max of lat/lon arrays.
+    Add/update 'data_footprint' (and 'scene_footprint') in attributes based
+    on the min/max of the latitude/longitude arrays.
 
-    Parameters:
-        attributes (dict): Dictionary to update.
-        lats (2D array): Latitude values.
-        lons (2D array): Longitude values.
+    Parameters
+    ----------
+    attributes : dict
+        Attribute dictionary to update in-place.
+    lats : 2D np.ndarray
+        Latitude grid.
+    lons : 2D np.ndarray
+        Longitude grid.
     """
+
     min_lat = float(np.min(lats))
     max_lat = float(np.max(lats))
     min_lon = float(np.min(lons))
     max_lon = float(np.max(lons))
 
-    # Counter-clockwise starting from lower-right
+    # Counter-clockwise polygon around bounding box, starting and ending at lower-right corner.
     polygon = (
         f"POLYGON(({max_lon} {min_lat},"
         f"{min_lon} {min_lat},"
@@ -485,11 +537,22 @@ def read_from_hdfeos5_file(file_name):
     attributes["collection"] = "hdfeos5"
     return attributes, decimal_dates, timeseries_datasets, dates, folder_name, lats, lons, shm
 
-def add_calculated_attributes(attributes):
+def add_calculated_attributes(attributes: dict) -> None:
+    """
+    Calculate and add attributes that can be inferred from CSV data.
+
+    Uses:
+    - LAT_ARRAY, LON_ARRAY: to compute REF_LAT and REF_LON (mean positions).
+    - DATE_COLUMNS: to compute first_date, last_date, and history.
+
+    These temporary keys are removed from the attributes dict.
+    """
+
     # calculate attributes from lat/lon and date columns (csv):
     # REF_LAT, REF_LON, first_date, last_date, history
 
-    if all(key in attributes for key in ["LAT_ARRAY", "LON_ARRAY", "DATE_COLUMNS"]):
+    required_keys = ("LAT_ARRAY", "LON_ARRAY", "DATE_COLUMNS")
+    if all(key in attributes for key in required_keys):
         lats = attributes.pop("LAT_ARRAY")
         lons = attributes.pop("LON_ARRAY")
         date_columns = attributes.pop("DATE_COLUMNS")
@@ -502,39 +565,55 @@ def add_calculated_attributes(attributes):
         attributes["last_date"] = sorted_dates[-1]
         attributes["history"] = datetime.now().strftime("%Y-%m-%d")
 
+def enrich_attributes_from_slcstack(attributes: dict, csv_path) -> dict:
+    """
+    Enrich attributes (mission, platform, beam_mode, look_direction, flight_direction,
+    relative_orbit) using metadata from slcStack.h5 and/or the standardized CSV filename.
 
-def enrich_attributes_from_slcstack(attributes, csv_path):
+    Parameters
+    ----------
+    attributes : dict
+        Attribute dictionary to update in-place.
+    csv_path : str or Path
+        Path to the CSV file (used to locate ../inputs/slcStack.h5 and to
+        parse mission/orbit info from the filename).
+
+    Returns
+    -------
+    dict
+        The updated attributes dictionary.
     """
-    Read mission/beam/orbit/etc. from slcStack.h5.
-    Looks for multiple common attribute names and falls back.
-    """
+
     try:
         csv_path = Path(csv_path).resolve()
         slc_path = csv_path.parent.parent / "inputs" / "slcStack.h5"
-        # Note FA: Can't we just read the metadata from slcStack instead of complicated processing?
+
+        # Primary source: metadata from slcStack.h5 (if available)
         if slc_path.exists():
             with h5py.File(slc_path, "r") as f:
-                def _get(attr, default=None):
-                    val = f.attrs.get(attr, default)
+
+                def _get(attr_name, default=None):
+                    val = f.attrs.get(attr_name, default)
                     if isinstance(val, (bytes, bytearray)):
                         val = val.decode("utf-8", "ignore")
                     return val
 
+                # Mission / platform
                 mission = _get("mission") or _get("MISSION")
                 platform = _get("platform") or _get("PLATFORM")
                 mission_value = mission or platform
                 if mission_value:
                     attributes["mission"] = mission_value
-                    #keep explicit platform too if available
+                    # Keep explicit platform too if available
                     if platform:
                         attributes["platform"] = platform
 
-                #beam_mode
+                # Beam mode
                 bm = _get("beam_mode")
                 if bm:
                     attributes["beam_mode"] = bm
 
-                #look / flight
+                # Look / flight direction
                 look = _get("look_direction")
                 if look:
                     attributes["look_direction"] = look
@@ -542,7 +621,7 @@ def enrich_attributes_from_slcstack(attributes, csv_path):
                 if fd:
                     attributes["flight_direction"] = fd
 
-                #relative orbit: accept several spellings
+                # Relative orbit: accept several spellings
                 rel_keys = ["relative_orbit", "orbit", "relativeOrbit", "relativeOrbitNumber"]
                 rel_val = None
                 for rk in rel_keys:
@@ -559,21 +638,26 @@ def enrich_attributes_from_slcstack(attributes, csv_path):
         else:
             print(f"[INFO] slcStack.h5 not found at: {slc_path}")
 
-        #fallback2: infer from standardized CSV filename if still missing OR only defaulted
+        # ------------------------------------------------------------------
+        # Fallback 2: infer from standardized CSV filename if still missing or only generic defaults are set.
+        # ------------------------------------------------------------------
         stem = Path(csv_path).stem.upper()
-        m = re.match(r'^(S1|TSX|ALOS|ERS|ENVISAT)_(\d{3})_', stem)
+        m = re.match(r"^(S1|TSX|ALOS|ERS|ENVISAT)_(\d{3})_", stem)
         if m:
-            file_mission = m.group(1)           # e.g., "TSX"
+            file_mission = m.group(1)  # e.g., "TSX"
             file_rel = int(m.group(2))
+
             # If mission was never set or is still the generic default, override it
             if not attributes.get("mission") or attributes.get("mission", "").upper() == "S1":
-                attributes["mission"] = file_mission.title()  # "TSX" -> "Tsx" (matches your other logs)
-            # Fill relative orbit if missing (yours already set this fine from HDF5)
+                # Keep the existing title-case behavior (e.g., "TSX" -> "Tsx")
+                attributes["mission"] = file_mission.title()
+
+            # Fill relative orbit if missing
             attributes.setdefault("relative_orbit", file_rel)
+
             # Sensible default for TSX
             if attributes.get("mission", "").upper() == "TSX":
                 attributes.setdefault("beam_mode", "SM")
-
 
     except Exception as e:
         print(f"[WARN] Could not read slcStack.h5 metadata: {e}")
@@ -581,7 +665,24 @@ def enrich_attributes_from_slcstack(attributes, csv_path):
     return attributes
 
 def read_from_csv_file(file_name):
-    # read data from csv file to be done by Emirhan
+    """
+    Read a SARvey/NOAA-style CSV and convert it into the structures expected by
+    hdfeos5_or_csv_2json_mbtiles.py.
+
+    Returns
+    -------
+    attributes : dict
+    decimal_dates : list[float]
+    timeseries_datasets : dict[str, np.ndarray]  # date -> (rows, cols)
+    dates : list[str]
+    folder_name : str
+    lats_grid : np.ndarray  # (rows, cols)
+    lons_grid : np.ndarray  # (rows, cols)
+    shm : None              # kept for symmetry with HDFEOS5 reader
+    quality_grids : dict[str, np.ndarray]  # name -> (rows, cols)
+    """
+    
+    # read data from csv file, done by Emirhan
     # the shared memory shm is confusing. it may also works without but be careful about returning or not returning shm.
 
     df = pd.read_csv(file_name)
@@ -589,13 +690,17 @@ def read_from_csv_file(file_name):
     # Normalize headers (trim spaces)
     df.columns = [c.strip() for c in df.columns]
 
-    # detect point_id (any case) and normalize to a new column 'point_ID'
+    # ----------------------------------------------------------------------
+    # Detect point_id (any case) and normalize to a new column 'point_ID'
+    # ----------------------------------------------------------------------
     pid_col = next((c for c in df.columns if c.lower() == "point_id"), None)
     if pid_col is not None:
         df["point_ID"] = pd.to_numeric(df[pid_col], errors="coerce")  # float with NaN is fine
         print(f"[INFO] Detected point_ID column: {pid_col} (non-null={df['point_ID'].notna().sum()})")
 
-    # dynamically detect latitude/longitude columns
+    # ----------------------------------------------------------------------
+    # Dynamically detect latitude/longitude columns
+    # ----------------------------------------------------------------------
     lat_candidates = ["Y_geocorr", "Latitude", "Y", "ycoord"]
     lon_candidates = ["X_geocorr", "Longitude", "X", "xcoord"]
 
@@ -605,41 +710,51 @@ def read_from_csv_file(file_name):
     print(f"Using columns: lat = {lat_col}, lon = {lon_col}")
 
     if lat_col is None or lon_col is None:
-        raise ValueError("Could not find latitude/longitude columns in the CSV. Supported names: 'Latitude', 'Y', 'ycoord' and 'Longitude', 'X', 'xcoord'.")
+        raise ValueError(
+            "Could not find latitude/longitude columns in the CSV. Supported names: "
+            "'Latitude', 'Y', 'ycoord' and 'Longitude', 'X', 'xcoord'."
+        )
 
     lats = df[lat_col].values
     lons = df[lon_col].values
 
-    # extract time-series data
+
+    # ----------------------------------------------------------------------
+    # Extract time-series data
+    # ----------------------------------------------------------------------
     sarvey_time_cols = [col for col in df.columns if col.startswith("D") and col[1:].isdigit()]
     is_sarvey_format = bool(sarvey_time_cols)
 
     if is_sarvey_format:
-        time_cols = sarvey_time_cols
-        time_cols.sort()
-        timeseries_data = df[time_cols].values / 1000  # SARvey
-        dates = [col[1:] for col in time_cols]  # remove "D" prefix
+        time_cols = sorted(sarvey_time_cols)
+        timeseries_data = df[time_cols].values / 1000.0  # SARvey: mm -> m
+        dates = [col[1:] for col in time_cols]           # remove "D" prefix
     else:
         time_cols = [col for col in df.columns if col.isdigit()]
-        timeseries_data = df[time_cols].values / 1000  # e.g. NOAA-TRE
+        timeseries_data = df[time_cols].values / 1000.0  # e.g. NOAA-TRE: mm -> m
         dates = time_cols
 
-    # 3D time-series array (time, y, x)
+    # ----------------------------------------------------------------------
+    # Build 3D time-series array (time, y, x)
+    # ----------------------------------------------------------------------
     num_points = len(df)
     num_dates = len(time_cols)
 
-    # reshape to 3D
+    # Reshape to a nearly square grid, padding with NaN
     num_rows = int(np.sqrt(num_points))
     num_cols = int(np.ceil(num_points / num_rows))
+
     padded = np.full((num_cols * num_rows, num_dates), np.nan)
     padded[:num_points, :] = timeseries_data
     reshaped = padded.reshape((num_rows, num_cols, num_dates)).transpose(2, 0, 1)
 
-    # decimal dates
+    # Decimal dates and per-date 2D arrays
     decimal_dates = [get_decimal_date(get_date(d)) for d in dates]
     timeseries_datasets = {d: reshaped[i, :, :] for i, d in enumerate(dates)}
 
-    # create initial attributes
+    # ----------------------------------------------------------------------
+    # Create initial attributes
+    # ----------------------------------------------------------------------
     attributes = {}
     attributes["PROJECT_NAME"] = "CSV_IMPORT"
     attributes["WIDTH"] = str(num_cols)
@@ -653,7 +768,7 @@ def read_from_csv_file(file_name):
 
     # Automatically set data_type based on filename or vertical velocity columns
     filename_upper = Path(file_name).stem.upper()
-    vert_col_candidates = ['VEL_V', 'V_STDEV_V']
+    vert_col_candidates = ["VEL_V", "V_STDEV_V"]
     has_vertical_columns = any(col in df.columns for col in vert_col_candidates)
 
     if "VERT" in filename_upper or has_vertical_columns:
@@ -663,71 +778,78 @@ def read_from_csv_file(file_name):
 
     print(f"[INFO] Set data_type: {attributes['data_type']}")
 
-    # FA 4/2025: attribute to be included in *.csv file as sarvey2csv.py --mission S1 --flight-direction D --relative-orbit 128
-    #replaced hard-coded lines with setdefault
-    #attributes.setdefault("mission", "S1")
-    #attributes.setdefault("flight_direction", "D")
-    #attributes.setdefault("relative_orbit", 128)
+    # replaced hard-coded lines with setdefault
     attributes.setdefault("PLATFORM", "S1")
     attributes.setdefault("MISSION", "S1")
 
+    # Enrich using slcStack.h5 and filename conventions
     attributes = enrich_attributes_from_slcstack(attributes, file_name)
 
-    #normalize mission/platform for InsarMaps (expects lower-case)
-    if attributes.get('mission') in (None, 'None', '', 'null'):
-        if attributes.get('MISSION'):
-            attributes['mission'] = attributes['MISSION']
+    # Normalize mission/platform for InsarMaps (expects lower-case)
+    # (current behavior: just fill from MISSION/PLATFORM if mission/platform missing)
+    if attributes.get("mission") in (None, "None", "", "null"):
+        if attributes.get("MISSION"):
+            attributes["mission"] = attributes["MISSION"]
 
-    if attributes.get('platform') in (None, 'None', '', 'null'):
-        if attributes.get('PLATFORM'):
-            attributes['platform'] = attributes['PLATFORM']
+    if attributes.get("platform") in (None, "None", "", "null"):
+        if attributes.get("PLATFORM"):
+            attributes["platform"] = attributes["PLATFORM"]
 
-    # make relative_orbit safe (turn into int --ifpossible)
-    if 'relative_orbit' in attributes:
+    # Make relative_orbit safe (turn into int if possible)
+    if "relative_orbit" in attributes:
         try:
-            attributes['relative_orbit'] = int(attributes['relative_orbit'])
+            attributes["relative_orbit"] = int(attributes["relative_orbit"])
         except Exception:
+            # leave as-is if it cannot be converted
             pass
 
-    add_calculated_attributes(attributes)   # FA 4/2025: need to make work for NOAA-TRE
+    # Calculate inferred attributes and geometry-related attributes
+    add_calculated_attributes(attributes)
     add_data_footprint_attribute(attributes, lats, lons)
-    add_dummy_attribute(attributes, is_sarvey_format)  # Remove once needed_attributes have been reduced. FA 4/2025: this shoulkd not depend on sarvey or NOAA
+    add_dummy_attribute(attributes, is_sarvey_format)  # Remove once needed_attributes reduced    
 
+    # ----------------------------------------------------------------------
+    # Build lat/lon grids (2D) matching timeseries layout
+    # ----------------------------------------------------------------------
     padded_lats = np.full(num_cols * num_rows, np.nan)
-    padded_lats [:num_points] = lats
+    padded_lats[:num_points] = lats
     lats_grid = padded_lats.reshape((num_rows, num_cols))
 
     padded_lons = np.full(num_cols * num_rows, np.nan)
     padded_lons[:num_points] = lons
     lons_grid = padded_lons.reshape((num_rows, num_cols))
 
+    # ----------------------------------------------------------------------
+    # Quality fields (DEM error, coherence, omega, st_consist, point_ID, ...)
+    # ----------------------------------------------------------------------
     quality_fields = {}
-    if 'dem_error' in df.columns and 'dem' in df.columns:
-        quality_fields['dem_error'] = df['dem_error'].values
-        quality_fields['elevation'] = df['dem_error'].values - df['dem'].values
-    if 'coherence' in df.columns:
-        quality_fields['coherence'] = df['coherence'].values
-    if 'omega' in df.columns:
-        quality_fields['omega'] = df['omega'].values
-    if 'st_consist' in df.columns:
-        quality_fields['st_consist'] = df['st_consist'].values
+
+    if "dem_error" in df.columns and "dem" in df.columns:
+        quality_fields["dem_error"] = df["dem_error"].values
+        quality_fields["elevation"] = df["dem_error"].values - df["dem"].values
+    if "coherence" in df.columns:
+        quality_fields["coherence"] = df["coherence"].values
+    if "omega" in df.columns:
+        quality_fields["omega"] = df["omega"].values
+    if "st_consist" in df.columns:
+        quality_fields["st_consist"] = df["st_consist"].values
 
     # Add point_ID if present (no default / None creation)
-    if 'point_ID' in df.columns:
-        quality_fields['point_ID'] = df['point_ID'].to_numpy(dtype=float)  # keeping as 1-D vector 
+    if "point_ID" in df.columns:
+        # keeping as 1-D vector; NaNs allowed
+        quality_fields["point_ID"] = df["point_ID"].to_numpy(dtype=float)
 
-
-    quality_grids = {
-        key: np.full(num_rows * num_cols, np.nan) for key in quality_fields
-    }
-
+    # Build 2D grids for all quality fields, padded like the time series
+    quality_grids = {key: np.full(num_rows * num_cols, np.nan) for key in quality_fields}
     for key, values in quality_fields.items():
         quality_grids[key][:num_points] = values
         quality_grids[key] = quality_grids[key].reshape((num_rows, num_cols))
 
+    # ----------------------------------------------------------------------
+    # Final outputs
+    # ----------------------------------------------------------------------
     folder_name = os.path.basename(file_name).split(".")[0]
-
-    shm = None
+    shm = None  # CSV path does not use shared memory
 
     print(" Check: read_from_csv_file output")
     print(" - timeseries_datasets keys:", list(timeseries_datasets.keys())[:3], "...")
@@ -737,19 +859,22 @@ def read_from_csv_file(file_name):
     print(" - Number of dates:", len(dates))
     print(" - Attributes:", attributes)
 
-    return attributes, decimal_dates, timeseries_datasets, dates, folder_name, lats_grid, lons_grid, shm, quality_grids
+    return (attributes, decimal_dates, timeseries_datasets, dates, folder_name, lats_grid, lons_grid, shm, quality_grids)
+
 # ---------------------------------------------------------------------------------------
 # START OF EXECUTABLE
 # ---------------------------------------------------------------------------------------
 def main():
+    """Entry point for hdfeos5_or_csv_2json_mbtiles.py."""
     parser = build_parser()
-    parseArgs = parser.parse_args()
-    file_name = parseArgs.file
-    output_folder = parseArgs.outputDir
+    args = parser.parse_args()
+    file_name = args.file
+    output_folder = args.outputDir
 
-    try: # create path for output
+    # Create path for output (or note if it already exists)
+    try:
         os.mkdir(output_folder)
-    except:
+    except FileExistsError:
         print(output_folder + " already exists")
 
     file_path = Path(file_name)
@@ -757,47 +882,93 @@ def main():
     # start clock to track how long conversion process takes
     start_time = time.perf_counter()
 
-    if file_path.suffix.lower() == ".he5":
-        attributes, decimal_dates, timeseries_datasets, dates, folder_name, lats, lons, shm = read_from_hdfeos5_file(file_name)
+    # ------------------------------------------------------------------
+    # Read input: either HDFEOS5 (.he5) or CSV
+    # ------------------------------------------------------------------
+    suffix = file_path.suffix.lower()
+    if suffix == ".he5":
+        (
+            attributes,
+            decimal_dates,
+            timeseries_datasets,
+            dates,
+            folder_name,
+            lats,
+            lons,
+            shm,
+        ) = read_from_hdfeos5_file(file_name)
         quality_params = None
-        # FA 4/2025: Initialize missing quality_params as zero arrays did not work. Problem in: [json.dumps(feature) for feature in points]
-        # shape = lats.shape
-        # quality_params = {
-        #     'dem_error': np.zeros(shape, dtype=np.float32),
-        #     'elevation': np.zeros(shape, dtype=np.float32),
-        #     'coherence': np.zeros(shape, dtype=np.float32),
-        #     'omega': np.zeros(shape, dtype=np.float32),
-        #     'st_consist': np.zeros(shape, dtype=np.float32)
-        # }
-    elif file_path.suffix.lower() == ".csv":
-        attributes, decimal_dates, timeseries_datasets, dates, folder_name, lats, lons, shm, quality_params = read_from_csv_file(file_name)
-    else:
-        raise FileNotFoundError(f"The file '{file_path}' does not exist or has not .he5 or .csv as extension.")
 
-    # read and convert the datasets, then write them into json files and insert into database
-    convert_data(attributes, decimal_dates, timeseries_datasets, dates, output_folder, folder_name, lats, lons, quality_params, parseArgs.num_workers)
+    elif suffix == ".csv":
+        (
+            attributes,
+            decimal_dates,
+            timeseries_datasets,
+            dates,
+            folder_name,
+            lats,
+            lons,
+            shm,
+            quality_params,
+        ) = read_from_csv_file(file_name)
+    else:
+        raise ValueError(
+            f"The file '{file_path}' must have .he5 or .csv as extension."
+        )
+
+    # ------------------------------------------------------------------
+    # Convert datasets to JSON chunks and write metadata
+    # ------------------------------------------------------------------
+    convert_data(
+        attributes,
+        decimal_dates,
+        timeseries_datasets,
+        dates,
+        output_folder,
+        folder_name,
+        lats,
+        lons,
+        quality_params,
+        args.num_workers,
+    )
+
+    # Clean up in-memory arrays
     del lats
     del lons
     if shm is not None:
         shm.close()
         shm.unlink()
 
-    # run tippecanoe command to get mbtiles file
+    # ------------------------------------------------------------------
+    # Run tippecanoe to generate MBTiles
+    # ------------------------------------------------------------------
     os.chdir(os.path.abspath(output_folder))
-    cmd = None
+
     if high_res_mode(attributes):
-        cmd = "tippecanoe *.json -P -l chunk_1 -x d -pf -pk -o " + folder_name + ".mbtiles 2> tippecanoe_stderr.log"
+        cmd = (
+            "tippecanoe *.json -P -l chunk_1 -x d -pf -pk -o "
+            + folder_name
+            + ".mbtiles 2> tippecanoe_stderr.log"
+        )
     else:
-        cmd = "tippecanoe *.json -P -l chunk_1 -x d -pf -pk -Bg -d9 -D12 -g12 -r0 -o " + folder_name + ".mbtiles 2> tippecanoe_stderr.log"
+        cmd = (
+            "tippecanoe *.json -P -l chunk_1 -x d -pf -pk "
+            "-Bg -d9 -D12 -g12 -r0 -o "
+            + folder_name
+            + ".mbtiles 2> tippecanoe_stderr.log"
+        )
 
     print("Now running tippecanoe with command %s" % cmd)
     os.system(cmd)
-    # ---------------------------------------------------------------------------------------
-    # check how long it took to read h5 file data and create json files
-    end_time =  time.perf_counter()
-    print(("time elapsed: " + str(end_time - start_time)))
+
+    # ------------------------------------------------------------------
+    # Check how long it took to read data and create JSON / MBTiles
+    # ------------------------------------------------------------------
+    end_time = time.perf_counter()
+    print("time elapsed: " + str(end_time - start_time))
     return
 
+
 # ---------------------------------------------------------------------------------------
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
