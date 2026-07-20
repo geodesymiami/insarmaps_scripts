@@ -1,25 +1,26 @@
 # Memory and performance notes: `hdfeos5_or_csv_2json_mbtiles.py`
 
-This document summarizes how parallelization works in `hdfeos5_or_csv_2json_mbtiles.py` (and the closely related `hdfeos5_2json_mbtiles.py`), why `--num-workers` can trigger OOM on large grids, how to choose worker counts, and how the tippecanoe step fits in. **No code changes were made** for this write-up.
+This document summarizes how parallelization works in `hdfeos5_or_csv_2json_mbtiles.py` (and the closely related `hdfeos5_2json_mbtiles.py`), why `--num-workers` can trigger OOM on large products, how to choose worker counts, and how the tippecanoe step fits in.
+
+See also `PLAN_EFFICIENCY_hdfeos5_2json_mbtiles.md` for a fuller efficiency plan (geocoded vs radar-coded terminology, tippecanoe, date scaling).
+
+**CSV / point path (updated):** CSV no longer pads into a fake √N grid. Points are 1D arrays; JSON workers iterate `range(start, end)` over point indices. HDFEOS5 is flattened row-major to the same 1D writer (`p` = flat index).
 
 ---
 
 ## How parallelization is implemented
 
 1. **Input load (HDFEOS5 `.he5`)**  
-   The full displacement cube is read from the file, masked, then copied into **`multiprocessing.shared_memory.SharedMemory`** so the 3D array lives in a shared buffer.  
-   `timeseries_datasets` is a **dict** mapping each date string to a **2D slice** (`np.squeeze` on the time axis) of that shared buffer—one 2D array per acquisition date.
+   The full displacement cube is read from the file, masked, then copied into **`multiprocessing.shared_memory.SharedMemory`**.  
+   `timeseries_datasets` maps each date to a **1D** array of length `WIDTH × LENGTH` (row-major flatten).
 
 2. **Work splitting**  
-   The grid is treated as a row-major flattened index of size `WIDTH × LENGTH`.  
-   It is split into **chunks of 20,000 grid indices** (`CHUNK_SIZE = 20000` in `convert_data`). Each chunk becomes one task.  
-   For example, with `columns: 6669` and `rows: 2599`,  
-   `num_points × 6669 × 2599 ≈ 1.73×10⁷`, so  
-   `ceil(num_points / 20000) ≈ 867` chunks (tasks).
+   Points are split into chunks of **20,000 indices** (`CHUNK_SIZE_DEFAULT`).  
+   Example: `N = 6669 × 2599 ≈ 1.73×10⁷` → `ceil(N / 20000) ≈ 867` tasks.
 
 3. **Execution**  
-   A `multiprocessing.Pool` with `num_workers` processes runs **`Pool.starmap(create_json, worker_args)`**.  
-   Each task calls `create_json(...)` with the same large objects passed in every tuple: `decimal_dates`, **`timeseries_datasets` (full dict of all per-date 2D arrays)**, `dates`, `lats`, `lons`, and the index range for that chunk.
+   A `multiprocessing.Pool` with `num_workers` runs **`Pool.starmap(create_json, worker_args)`**.  
+   Each task still receives the full `timeseries_datasets` / `lats` / `lons` in the argument tuple (pickling cost unchanged; see below).
 
 4. **Tippecanoe**  
    After JSON chunks and `metadata.pickle` are written, the script **`os.chdir`**s to the output directory and runs **`tippecanoe`** via `os.system` on all `*.json` files, producing a single `.mbtiles` file. This is **not** parallelized inside Python; tippecanoe is its own process.
