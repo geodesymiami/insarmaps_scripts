@@ -33,8 +33,9 @@ import pandas as pd
 chunk_num = Value("i", 0)
 
 # Lat/lon column candidates (CSV). Keep in sync with minsar/insarmaps_utils/insarmaps_csv_geo.py
-LAT_CANDIDATES = ["Y_geocorr", "Latitude", "Y", "ycoord"]
-LON_CANDIDATES = ["X_geocorr", "Longitude", "X", "xcoord"]
+# Matching is case-insensitive (EGMS uses latitude/longitude).
+LAT_CANDIDATES = ["Y_geocorr", "Latitude", "latitude", "Y", "ycoord"]
+LON_CANDIDATES = ["X_geocorr", "Longitude", "longitude", "X", "xcoord"]
 
 CHUNK_SIZE_DEFAULT = 20000
 
@@ -253,11 +254,7 @@ def convert_data(
         timeseries_datasets, lats, lons, quality_params
     )
     num_points = int(lats.size)
-    print(f"points: {num_points}")
-
-    with chunk_num.get_lock():
-        chunk_num.value = 0
-
+    n_dates = len(dates)
     worker_args = generate_point_worker_args(
         decimal_dates,
         timeseries_datasets,
@@ -269,6 +266,14 @@ def convert_data(
         lons,
         quality_params,
     )
+    num_chunks = len(worker_args)
+    print(
+        f"[INFO] JSON plan: {num_points} points × {n_dates} dates → "
+        f"{num_chunks} chunk file(s) (chunk_size={chunk_size}, num_workers={num_workers})"
+    )
+
+    with chunk_num.get_lock():
+        chunk_num.value = 0
 
     process_pool = Pool(num_workers)
     process_pool.starmap(create_json, worker_args)
@@ -498,82 +503,35 @@ def add_calculated_attributes(attributes: dict) -> None:
         attributes["history"] = datetime.now().strftime("%Y-%m-%d")
 
 
-def enrich_attributes_from_slcstack(attributes: dict, csv_path) -> dict:
+def enrich_attributes_from_csv_filename(attributes: dict, csv_path) -> dict:
     """
-    Enrich attributes from ../inputs/slcStack.h5 and/or standardized CSV filename.
+    Enrich mission / relative_orbit / beam_mode from a standardized CSV stem
+    like ``S1_044_...`` or ``TSX_135_...`` when still missing.
     """
-    try:
-        csv_path = Path(csv_path).resolve()
-        slc_path = csv_path.parent.parent / "inputs" / "slcStack.h5"
+    stem = Path(csv_path).stem.upper()
+    m = re.match(r"^(S1|TSX|ALOS|ERS|ENVISAT)_(\d{3})_", stem)
+    if not m:
+        return attributes
 
-        if slc_path.exists():
-            with h5py.File(slc_path, "r") as f:
+    file_mission = m.group(1)
+    file_rel = int(m.group(2))
 
-                def _get(attr_name, default=None):
-                    val = f.attrs.get(attr_name, default)
-                    if isinstance(val, (bytes, bytearray)):
-                        val = val.decode("utf-8", "ignore")
-                    return val
+    if not attributes.get("mission") or attributes.get("mission", "").upper() == "S1":
+        attributes["mission"] = file_mission.title()
 
-                mission = _get("mission") or _get("MISSION")
-                platform = _get("platform") or _get("PLATFORM")
-                mission_value = mission or platform
-                if mission_value:
-                    attributes["mission"] = mission_value
-                    if platform:
-                        attributes["platform"] = platform
+    attributes.setdefault("relative_orbit", file_rel)
 
-                bm = _get("beam_mode")
-                if bm:
-                    attributes["beam_mode"] = bm
-
-                look = _get("look_direction")
-                if look:
-                    attributes["look_direction"] = look
-                fd = _get("flight_direction")
-                if fd:
-                    attributes["flight_direction"] = fd
-
-                rel_keys = ["relative_orbit", "orbit", "relativeOrbit", "relativeOrbitNumber"]
-                rel_val = None
-                for rk in rel_keys:
-                    v = _get(rk)
-                    if v is not None:
-                        rel_val = v
-                        break
-                if rel_val is not None:
-                    try:
-                        attributes["relative_orbit"] = int(rel_val)
-                    except Exception:
-                        attributes["relative_orbit"] = rel_val
-        else:
-            print(f"[INFO] slcStack.h5 not found at: {slc_path}")
-
-        stem = Path(csv_path).stem.upper()
-        m = re.match(r"^(S1|TSX|ALOS|ERS|ENVISAT)_(\d{3})_", stem)
-        if m:
-            file_mission = m.group(1)
-            file_rel = int(m.group(2))
-
-            if not attributes.get("mission") or attributes.get("mission", "").upper() == "S1":
-                attributes["mission"] = file_mission.title()
-
-            attributes.setdefault("relative_orbit", file_rel)
-
-            if attributes.get("mission", "").upper() == "TSX":
-                attributes.setdefault("beam_mode", "SM")
-
-    except Exception as e:
-        print(f"[WARN] Could not read slcStack.h5 metadata: {e}")
+    if attributes.get("mission", "").upper() == "TSX":
+        attributes.setdefault("beam_mode", "SM")
 
     return attributes
 
 
 def detect_lat_lon_columns(columns):
-    """Return (lat_col, lon_col) from header names using LAT/LON_CANDIDATES."""
-    colmap = {c: c for c in columns}
-    lat_col = next((colmap[c] for c in LAT_CANDIDATES if c in colmap), None)
-    lon_col = next((colmap[c] for c in LON_CANDIDATES if c in colmap), None)
+    """Return (lat_col, lon_col) from header names using LAT/LON_CANDIDATES (case-insensitive)."""
+    lower_map = {str(c).lower(): c for c in columns}
+    lat_col = next((lower_map[c.lower()] for c in LAT_CANDIDATES if c.lower() in lower_map), None)
+    lon_col = next((lower_map[c.lower()] for c in LON_CANDIDATES if c.lower() in lower_map), None)
     return lat_col, lon_col
 
 
@@ -646,7 +604,7 @@ def read_from_csv_file(file_name):
 
     attributes.setdefault("PLATFORM", "S1")
     attributes.setdefault("MISSION", "S1")
-    attributes = enrich_attributes_from_slcstack(attributes, file_name)
+    attributes = enrich_attributes_from_csv_filename(attributes, file_name)
 
     if attributes.get("mission") in (None, "None", "", "null"):
         if attributes.get("MISSION"):
@@ -672,14 +630,21 @@ def read_from_csv_file(file_name):
         quality_params["elevation"] = (
             df["dem_error"].to_numpy(dtype=float) - df["dem"].to_numpy(dtype=float)
         )
+    elif "height_ortho" in df.columns:
+        # EGMS / similar: orthometric height as elevation popup field
+        quality_params["elevation"] = df["height_ortho"].to_numpy(dtype=float)
     if "coherence" in df.columns:
         quality_params["coherence"] = df["coherence"].to_numpy(dtype=float)
+    elif "temporal_coherence" in df.columns:
+        quality_params["coherence"] = df["temporal_coherence"].to_numpy(dtype=float)
     if "omega" in df.columns:
         quality_params["omega"] = df["omega"].to_numpy(dtype=float)
     if "st_consist" in df.columns:
         quality_params["st_consist"] = df["st_consist"].to_numpy(dtype=float)
     if "point_ID" in df.columns:
         quality_params["point_ID"] = df["point_ID"].to_numpy(dtype=float)
+    elif "pid" in df.columns:
+        quality_params["point_ID"] = pd.to_numeric(df["pid"], errors="coerce").to_numpy(dtype=float)
 
     folder_name = os.path.basename(file_name).split(".")[0]
     shm = None

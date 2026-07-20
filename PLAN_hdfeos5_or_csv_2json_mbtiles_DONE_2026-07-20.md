@@ -40,7 +40,7 @@ Git history: **attribute/CSV work landed in `hdfeos5_or_csv_2json_mbtiles.py`** 
 
 1. Keep upload rule: only keys present in both `attributes` and `needed_attributes` (match he5-only philosophy).
 2. High-res (CSV): also drop `X_STEP`,`Y_STEP`,`X_FIRST`,`Y_FIRST`; **also drop `WIDTH`/`LENGTH`** from the needed copy so fake/point dims are not uploaded (cleaner than inventing √N or `LENGTH=1`).
-3. Keep CSV **real** enrichment: `add_calculated_attributes`, footprint from points, slcStack/filename enrich — not Galapagos for those.
+3. Keep CSV **real** enrichment: `add_calculated_attributes`, footprint from points, optional standardized filename enrich — not Galapagos for those.
 4. Keep `add_dummy_attribute` for now so existing CSV ingest still satisfies Insarmaps’ long attribute list (behavior preserve); do **not** expand dummies. Optional later PR: shrink `needed_attributes` like the he5 comment (“TODO: … extra_attributes”).
 5. Keep forced `"dem"` popup key in or_csv (he5-only lacks it; or_csv added it for elevation UI) unless we confirm it is unused for pure point clouds — default **keep**.
 6. Do not “fix” the missing-comma bug in `hdfeos5_2json_mbtiles.py` (user: do not modify that file).
@@ -152,7 +152,7 @@ Within one file (or minimal helpers module if preferred):
 - `extract_time_series_from_df`
 - `build_quality_arrays` (1D)
 - `create_json_points` / `generate_point_worker_args`
-- Keep `enrich_attributes_from_slcstack`, `add_dummy_attribute`, `add_calculated_attributes` logic identical
+- Keep `enrich_attributes_from_csv_filename`, `add_dummy_attribute`, `add_calculated_attributes` logic identical
 
 Sync LAT/LON candidate lists with `minsar/insarmaps_utils/insarmaps_csv_geo.py` (still no EGMS `latitude`/`longitude` in this PR unless trivial case-insensitive add is approved — **default: no EGMS change here**).
 
