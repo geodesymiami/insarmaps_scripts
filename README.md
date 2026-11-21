@@ -17,29 +17,46 @@ The below install instructions have been tested on ubuntu 22.04. Installing on W
 ## Converting a dataset: hdfeos5_2json_mbtiles.py, hdfeos5_or_csv_2json_mbtiles.py
 
 `hdfeos5_2json_mbtiles.py FILE.he5 DIR` and `hdfeos5_or_csv_2json_mbtiles.py FILE.he5|FILE.csv DIR` write the dataset to
-DIR as `chunk_*.json` (one GeoJSON Feature per point and line) and `metadata.pickle`. They no longer make a
-`.mbtiles`: the map draws a dataset only from its recolor store, which the upload builds. (The names stay, since minsar
-calls the scripts by them.)
+DIR as its points, numpy arrays (`points_bundle.py`: `points.json`, `p.npy`, `lon.npy`, `lat.npy`, `m.npy`, `d.npy`,
+and `attr_NAME.npy` for a CSV's quality columns; insarmaps `docs/recolor-store.md` section 12), and `metadata.pickle`.
+They read the input once and write no JSON and no `.mbtiles`; files of an earlier run in DIR are replaced. (The names
+stay, since minsar calls the scripts by them; `--num-workers` is accepted and not needed.)
+
+- A grid cell (`.he5`) or CSV row becomes a point when it has values at two dates or more; a missing value is NaN in
+  `d`, and the point's velocity `m` is the least-squares slope over the dates it has.
+- `p`: `hdfeos5_2json_mbtiles.py` counts the points from the first cell of each block of 20,000 cells;
+  `hdfeos5_or_csv_2json_mbtiles.py` uses the cell's flat index or the CSV row (0 for the first data row), as their JSON
+  did.
+- `d` holds the input's values exactly: float32 from an HDF-EOS5 file, float64 from a CSV (mm converted to m).
+- A CSV's quality columns keep their order; `point_ID` is an integer column when its values are whole numbers that fit
+  int32; a missing quality value is NaN, and NULL in the point table.
+- A point without a finite position stops step 1 with a message saying which row.
 
 ## Uploading a dataset: json_mbtiles2insarmaps.py
 
 `json_mbtiles2insarmaps.py --json_folder DIR -u DBUSER -p DBPASS --host HOST` uploads the dataset that
-`hdfeos5_2json_mbtiles.py` or `hdfeos5_or_csv_2json_mbtiles.py` wrote to DIR (`metadata.pickle` and `chunk_*.json`).
+`hdfeos5_2json_mbtiles.py` or `hdfeos5_or_csv_2json_mbtiles.py` wrote to DIR (`metadata.pickle` and the points). It
+refuses a DIR that holds only the `chunk_*.json` of an older step 1: update insarmaps_scripts where step 1 ran, and run
+it again.
 It runs on the insarmaps server itself, where the database is (minsar's `ingest_insarmaps.bash` step 2 does this over
 ssh, with `--host 127.0.0.1`), and connects to port 5432 unless `PGPORT` names another.
 
 1. It removes a dataset of the same name, with its recolor store (if that removal fails, nothing is uploaded), then
-   adds the dataset's row to `area` and loads the chunk files into its point table with ogr2ogr.
-2. It checks that the table got every feature of the chunk files. If not, it removes the partly loaded dataset and
-   fails.
+   adds the dataset's row to `area`, creates its point table as ogr2ogr used to (`ogc_fid`, `d`, `m`, `p`, the quality
+   columns, `wkb_geometry`, and the spatial index), and loads the points into it with binary COPY, in `p` order. A
+   failed load removes the dataset.
+2. It checks that the table got every point. If not, it removes the partly loaded dataset and fails.
 3. It writes the dataset's `m_min` and `m_max` to `extra_attributes` (insarmaps `POST /preLoad` answers from them),
-   then indexes and clusters the table on `p`.
+   then indexes the table on `p` and marks that index as the table's clustering index (the rows went in in `p`
+   order, so no rewrite is needed).
 4. It builds the dataset's recolor store (insarmaps `docs/recolor-store.md`), from which the map draws the dataset,
-   and checks it against the table. If the store can't be built or fails its check, the store is removed and the
-   upload fails; the dataset stays in the database, but the map can't show it until its store is built (insarmaps
-   `tools/recolor_store/migrate.py --only AREA_ID`, or an upload of the dataset again).
+   from the same points (`tools/recolor_store/convert_from_points.py`), and checks it against the table. Points
+   drop out at low zooms as with tippecanoe's `-r 2.5` and base zoom 14, or base zoom 12 for a geocoded dataset.
+   If the store can't be built or fails its check, the store is
+   removed and the upload fails; the dataset stays in the database, but the map can't show it until its store is
+   built (an upload of the dataset again, or insarmaps `tools/recolor_store/migrate.py --only AREA_ID`).
 
-It fails before anything changes when there are no chunk files, the store folder is missing or not writable, the
+It fails before anything changes when DIR has no points, the store folder is missing or not writable, the
 insarmaps tools are not there, or the store wouldn't leave `--recolor-store-min-free-gb` (20) free (the store of a
 dataset it replaces counts as free). It also refuses another database's store folder (for example the live one, while
 uploading to a copy of the database): the folder records its database in `.insarmaps-database` (the first upload or

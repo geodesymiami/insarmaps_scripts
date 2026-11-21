@@ -3,11 +3,12 @@
 The insarmaps map draws a dataset only from its recolor store, a set of files per dataset in a folder named by its
 area id. After json_mbtiles2insarmaps.py has loaded a dataset's point table, this module
 
-- checks that the table holds every feature of the chunk files,
+- checks that the table holds every point step 1 wrote,
 - writes the extra_attributes m_min and m_max, which POST /preLoad answers from,
-- builds the store from the table and checks it against the table, with the insarmaps repository's tools
-  (tools/recolor_store/convert_from_postgres.py and check_against_postgres.py), each run as its own process by the
-  Python running the ingest, which has the numpy and psycopg2 they need;
+- builds the store from the points step 1 wrote (the same arrays the table was loaded from) and checks it against
+  the table, with the insarmaps repository's tools (tools/recolor_store/convert_from_points.py and
+  check_against_postgres.py), each run as its own process by the Python running the ingest, which has the numpy and
+  psycopg2 they need;
 
 and when a dataset is removed or ingested again (a re-ingest gets a new area id), it removes the old store.
 
@@ -52,40 +53,17 @@ class StoreError(Exception):
     pass
 
 
-# ---------------------------------------------------------------------------------------------- the chunk files
+# ---------------------------------------------------------------------------------------------- step 1's folder
 
 def json_chunk_files(folder):
-    """The files json_mbtiles2insarmaps.py loads, sorted: those whose second dot-separated part is json
-    (chunk_<k>.json)."""
+    """The JSON chunk files an older step 1 wrote (chunk_<k>.json: the second dot-separated part is json), sorted:
+    the upload refuses a folder that has only these."""
     out = []
     for name in sorted(os.listdir(folder)):
         parts = name.split('.')
         if len(parts) > 1 and parts[1] == 'json' and os.path.isfile(os.path.join(folder, name)):
             out.append(name)
     return out
-
-
-def count_features(folder, files):
-    """The features in the chunk files: the ingest scripts write one GeoJSON Feature per line."""
-    n = 0
-    for name in files:
-        with open(os.path.join(folder, name), 'rb') as f:
-            for line in f:
-                if line.strip():
-                    n += 1
-    return n
-
-
-def extra_properties(folder, files):
-    """How many properties besides d, m and p the first feature has (the CSV quality columns): each becomes a
-    column of the table and a file of the store."""
-    for name in files:
-        with open(os.path.join(folder, name), 'rb') as f:
-            for line in f:
-                if line.strip():
-                    props = json.loads(line).get('properties') or {}
-                    return len([k for k in props if k not in ('d', 'm', 'p')])
-    return 0
 
 
 def dates_in_metadata(metadata):
@@ -124,7 +102,7 @@ def check_root(root, tools):
         raise StoreError(f'the recolor store root {root} does not exist (--recolor-store-root)')
     if not os.access(root, os.W_OK | os.X_OK):
         raise StoreError(f'the recolor store root {root} is not writable by this user')
-    for name in ('convert_from_postgres.py', 'check_against_postgres.py'):
+    for name in ('convert_from_points.py', 'check_against_postgres.py'):
         if not os.path.isfile(os.path.join(tools, name)):
             raise StoreError(f'{os.path.join(tools, name)} not found: --recolor-tools names the insarmaps '
                              f'repository\'s tools/recolor_store')
@@ -268,11 +246,12 @@ def run_tool(script, args, password, python=None):
     return p.returncode, report, p.stderr.strip()
 
 
-def build_and_check_store(area_id, unavco_name, points, dates, attributes, conninfo, password, root=DEFAULT_ROOT,
-                          tools=DEFAULT_TOOLS, min_free_gb=DEFAULT_MIN_FREE_GB, python=None):
-    """Builds <root>/<area_id> from the dataset's point table (convert_from_postgres.py, levels from tippecanoe's
-    drop rule), then checks it against the table (check_against_postgres.py). Raises StoreError when it can't be
-    built, or when it fails its check, after removing it. Returns what was built and how long it took."""
+def build_and_check_store(area_id, unavco_name, points, dates, attributes, points_dir, conninfo, password,
+                          root=DEFAULT_ROOT, tools=DEFAULT_TOOLS, min_free_gb=DEFAULT_MIN_FREE_GB, python=None):
+    """Builds <root>/<area_id> from the points step 1 wrote in points_dir (convert_from_points.py, levels from
+    tippecanoe's drop rule), then checks it against the point table (check_against_postgres.py). Raises StoreError
+    when it can't be built, or when it fails its check, after removing it. Returns what was built and how long it
+    took."""
     area_id = int(area_id)
     check_root(root, tools)
     store = os.path.join(root, str(area_id))
@@ -284,8 +263,8 @@ def build_and_check_store(area_id, unavco_name, points, dates, attributes, conni
                              f'{ds.get("area_id")}): not replacing it. Is {root} the store root of this database?')
     check_space(root, estimate_store_bytes(points, dates, attributes), min_free_gb)
     t0 = time.time()
-    code, out, err = run_tool(os.path.join(tools, 'convert_from_postgres.py'),
-                              [str(area_id), '--root', root, '--no-mbtiles', '--replace', '--dsn', conninfo],
+    code, out, err = run_tool(os.path.join(tools, 'convert_from_points.py'),
+                              [str(area_id), '--root', root, '--points', points_dir, '--replace', '--dsn', conninfo],
                               password, python)
     built_s = time.time() - t0
     if code != 0 or not out:
@@ -305,6 +284,7 @@ def build_and_check_store(area_id, unavco_name, points, dates, attributes, conni
         raise StoreError(f'the recolor store failed its check against the table ({why}); '
                          f'{"removed it" if removed else "no store left"}')
     return {'area_id': area_id, 'build': out.get('build'), 'points': out.get('points'), 'dates': out.get('dates'),
+            'levels_source': out.get('levels_source'),
             'bytes': out.get('bytes'), 'missing_values': (out.get('missing') or {}).get('values'),
             'attributes': out.get('attributes'), 'max_abs_diff_cm_per_yr': rep.get('max_abs_diff_cm_per_yr'),
             'build_s': round(built_s, 1), 'check_s': round(check_s, 1)}
