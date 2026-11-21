@@ -6,10 +6,12 @@
 ############################################################
 
 
+import io
 import os
 import sys
 import argparse
 import pickle
+import struct
 import time
 import numpy
 
@@ -17,9 +19,8 @@ from add_attribute_insarmaps import (
     InsarDatabaseController,
     InsarDatasetController,
 )
-from queue import Queue
-from threading import Thread
 
+import points_bundle
 import recolor_store_ingest as rsi
 
 
@@ -81,46 +82,131 @@ def upload_insarmaps_metadata(fileName):
 
     attributesController.close()
 
-def worker(queue):
-    # """Process files from the queue."""
-    for args in iter(queue.get, None):
-        try:
-            command = args[0]
-            file = args[1]
+# ---------------------------------------------------------------------------------------------- the point table
 
-            res = os.system(command)
+COPY_BYTES = 64 << 20      # binary COPY data per COPY statement, about
 
-            if res != 0:
-                msg = "Error inserting into the database."
-                msg += " This is most often due to running out of Memory (RAM)"
-                msg += ", or incorrect database credentials... quitting"
-                sys.stderr.write(msg)
-                os._exit(-1)
+def copy_rows(p, lon, lat, m, d, attributes, types):
+    """The points as binary COPY data (PostgreSQL's binary format) for the columns wkb_geometry, d, m, p and then the
+    attribute columns, in p order: yields one complete COPY body (header, rows, trailer) per block of rows.
+    wkb_geometry is an EWKB point with SRID 4326; d a float8 array with one element per date, NaN where missing. An
+    attribute value that is missing (NaN; for an integer column any value that isn't finite) goes in as NULL, as the
+    JSON null of an older step 1 did; nothing else is NULL."""
+    P, N = d.shape
+    names = list(attributes)
+    base = [('nf', '>i2'), ('lg', '>i4'), ('bo', 'u1'), ('gt', '<u4'), ('srid', '<u4'), ('x', '<f8'), ('y', '<f8'),
+            ('ld', '>i4'), ('ndim', '>i4'), ('flags', '>i4'), ('oid', '>u4'), ('n', '>i4'), ('lb', '>i4'),
+            ('e', [('len', '>i4'), ('v', '>f8')], (N,)), ('lm', '>i4'), ('m', '>f8'), ('lp', '>i4'), ('p', '>i4')]
 
-            print("Inserted " + file + " to db")
+    def row_type(present):
+        fields = list(base)
+        for k, name in enumerate(names):
+            fields.append(('la%d' % k, '>i4'))
+            if present[k]:
+                fields.append(('a%d' % k, '>i4' if types[name] == 'integer' else '>f8'))
+        return numpy.dtype(fields)
 
-        except Exception as e: # catch exceptions to avoid exiting the
-                               # thread prematurely
-           print('%r failed: %s' % (args, e,))
+    def encode(s0, s1, present):
+        r = numpy.zeros(s1 - s0, dtype=row_type(present))
+        r['nf'] = 4 + len(names)
+        r['lg'] = 25                        # the EWKB point: byte order, type, SRID, x, y
+        r['bo'] = 1                         # little endian
+        r['gt'] = 1 | 0x20000000            # Point, with an SRID
+        r['srid'] = 4326
+        r['x'] = lon[s0:s1]
+        r['y'] = lat[s0:s1]
+        r['ld'] = 20 + 12 * N               # the array: 5 int32 of header, then N x (int32 length, float8)
+        r['ndim'] = 1
+        r['flags'] = 0                      # no NULL elements
+        r['oid'] = 701                      # float8
+        r['n'] = N
+        r['lb'] = 1
+        r['e']['len'] = 8
+        r['e']['v'] = d[s0:s1]
+        r['lm'] = 8
+        r['m'] = m[s0:s1]
+        r['lp'] = 4
+        r['p'] = p[s0:s1]
+        for k, name in enumerate(names):
+            if present[k]:
+                r['la%d' % k] = 4 if types[name] == 'integer' else 8
+                r['a%d' % k] = attributes[name][s0:s1]
+            else:
+                r['la%d' % k] = -1              # NULL
+        return r.tobytes()
 
-def upload_json(folder_path, num_workers=1, store_root=rsi.DEFAULT_ROOT, store_tools=rsi.DEFAULT_TOOLS,
-                min_free_gb=rsi.DEFAULT_MIN_FREE_GB):
-    """Loads the dataset of folder_path (metadata.pickle, chunk_*.json) into the database, replacing a dataset of
-    the same name, then builds and checks its recolor store in store_root. Exits with code 1, saying why, when the
-    table doesn't hold every feature (the partly loaded dataset is removed) or the store can't be built or fails its
-    check (the dataset stays, without a store)."""
+    header = b'PGCOPY\n\xff\r\n\x00' + struct.pack('>ii', 0, 0)
+    trailer = struct.pack('>h', -1)
+    step = max(1, COPY_BYTES // row_type([True] * len(names)).itemsize)
+    for c0 in range(0, P, step):
+        c1 = min(c0 + step, P)
+        if names:
+            missing = numpy.column_stack([
+                ~numpy.isfinite(attributes[nm][c0:c1]) if types[nm] == 'integer' else numpy.isnan(attributes[nm][c0:c1])
+                for nm in names])
+        else:
+            missing = numpy.zeros((c1 - c0, 0), dtype=bool)
+        if not missing.any():
+            yield header + encode(c0, c1, [True] * len(names)) + trailer
+            continue
+        # rows with NULLs are shorter: encode each run of rows that have the same columns missing, in order
+        patterns, pattern = numpy.unique(missing, axis=0, return_inverse=True)
+        pattern = pattern.reshape(-1)
+        starts = numpy.concatenate(([0], numpy.flatnonzero(numpy.diff(pattern)) + 1, [c1 - c0]))
+        parts = [encode(c0 + s0, c0 + s1, ~patterns[pattern[s0]]) for s0, s1 in zip(starts[:-1], starts[1:])]
+        yield header + b''.join(parts) + trailer
+
+def load_table(con, area_id, p, lon, lat, m, d, attributes, types):
+    """Creates the dataset's point table as ogr2ogr made it (ogc_fid, d, m, p, the attribute columns, wkb_geometry;
+    the primary key and the spatial index) and loads the points, in p order, with binary COPY, in one transaction.
+    The table's name is the area id, and the attribute names passed points_bundle's check (letters, digits, _)."""
+    table = '"%s"' % int(area_id)
+    extra = "".join(', "%s" %s' % (name, types[name]) for name in attributes)
+    columns = "wkb_geometry, d, m, p" + "".join(', "%s"' % name for name in attributes)
+    cur = con.cursor()
+    cur.execute('CREATE TABLE %s (ogc_fid serial PRIMARY KEY, d double precision[], m double precision, '  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query
+                'p integer%s, wkb_geometry geometry(Point,4326))' % (table, extra))
+    for body in copy_rows(p, lon, lat, m, d, attributes, types):
+        cur.copy_expert('COPY %s (%s) FROM STDIN (FORMAT binary)' % (table, columns), io.BytesIO(body))
+    cur.execute('CREATE INDEX "%s_wkb_geometry_geom_idx" ON %s USING gist (wkb_geometry)' % (int(area_id), table))  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query
+    con.commit()
+
+def mark_clustered(con, area_id):
+    """The rows went in in p order: marking the p index as the table's clustering index is what CLUSTER would do,
+    without rewriting the table."""
+    cur = con.cursor()
+    cur.execute('ALTER TABLE "%d" CLUSTER ON "%d_p_idx"' % (int(area_id), int(area_id)))  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query
+    con.commit()
+
+def upload_points(folder_path, store_root=rsi.DEFAULT_ROOT, store_tools=rsi.DEFAULT_TOOLS,
+                  min_free_gb=rsi.DEFAULT_MIN_FREE_GB):
+    """Loads the dataset of folder_path (metadata.pickle and the points step 1 wrote, points_bundle.py) into the
+    database, replacing a dataset of the same name, then builds and checks its recolor store in store_root. Exits
+    with code 1, saying why, when the folder holds no points (the JSON chunk files of an older step 1 are not read any
+    more), when the table doesn't hold every point (the partly loaded dataset is removed), or when the store can't be
+    built or fails its check (the dataset stays, without a store)."""
     global dbUsername, dbPassword, dbHost
     t_start = time.time()
     timing = {}
+    if not points_bundle.has_points(folder_path):
+        if rsi.json_chunk_files(folder_path):
+            fail("%s holds the JSON chunk files of an older step 1, which the upload doesn't read any more. Update "
+                 "insarmaps_scripts on the machine that ran step 1 (git pull in $MINSAR_HOME/tools/insarmaps_scripts) "
+                 "and run step 1 again" % folder_path)
+        fail("no points in %s (points.json): run step 1 first" % folder_path)
     metadata = read_metadata(folder_path)
     area_name = metadata["area"]
-    chunk_files = rsi.json_chunk_files(folder_path)
-    if not chunk_files:
-        fail("no chunk_*.json files in " + folder_path)
-    features = rsi.count_features(folder_path, chunk_files)
+    try:
+        manifest, p, lon, lat, m, d, attributes = points_bundle.read_points(folder_path)
+    except (points_bundle.PointsError, OSError, ValueError, KeyError) as e:
+        fail("the points in %s can't be read: %s" % (folder_path, e))
     num_dates = rsi.dates_in_metadata(metadata)
-    num_extra = rsi.extra_properties(folder_path, chunk_files)
-    print("%s: %d features, %d dates, in %d chunk files" % (area_name, features, num_dates, len(chunk_files)))
+    if manifest["dates"] != num_dates:
+        fail("the points in %s have %d dates, its metadata.pickle %d" % (folder_path, manifest["dates"], num_dates))
+    features = manifest["points"]
+    num_extra = len(attributes)
+    print("%s: %d points, %d dates%s" % (area_name, features, num_dates,
+                                         (", attributes " + ", ".join(attributes)) if attributes else ""))
     # everything the recolor store needs is checked before anything changes
     try:
         rsi.check_root(store_root, store_tools)
@@ -162,53 +248,26 @@ def upload_json(folder_path, num_workers=1, store_root=rsi.DEFAULT_ROOT, store_t
     # we need this entry to get the db to generate an id for area which
     # we use to name the corresponding table for the dataset
     upload_insarmaps_metadata(folder_path + "/metadata.pickle")
-    # create index
-    print("Creating index on " + area_name)
     attributesController.connect()
     area_id = str(attributesController.get_dataset_id(area_name))
-    attributesController.close()
     print("Area id: " + area_id)
-    firstJsonFile = True
+
     t0 = time.time()
-
-    q = Queue()
-    threads = [Thread(target=worker, args=(q,)) for _ in range(num_workers)]
-    for t in threads:
-        t.daemon = True # threads die if the program dies
-        t.start()
-
-    for file in chunk_files:
-        # insert json file to pgsql using ogr2ogr
-        command = 'ogr2ogr -append -f "PostgreSQL" PG:"dbname=pgis ' + \
-                  ' host=' + dbHost + ' user=' + dbUsername + ' password=' + dbPassword + \
-                  '" --config PG_USE_COPY YES -nln ' + area_id + ' ' + folder_path + '/' + file
-        # only provide layer creation options if this is the first file
-        if firstJsonFile:
-            command = 'ogr2ogr -lco LAUNDER=NO -append -f "PostgreSQL" PG:"dbname=pgis ' + \
-                      ' host=' + dbHost + ' user=' + dbUsername + ' password=' + dbPassword + \
-                      '" --config PG_USE_COPY YES -nln ' + area_id + ' ' + folder_path + '/' + file
-            firstJsonFile = False
-            # upload first one with layer creation options prior
-            # to spawning processes to upload the rest
-            res = os.system(command)
-            print("Inserted " + file + " to db")
-
-            if res != 0:
-                msg = "Error inserting into the database."
-                msg += " This is most often due to running out of Memory (RAM)"
-                msg += ", or incorrect database credentials... quitting"
-                sys.stderr.write(msg)
-                os._exit(-1)
-        else:
-            q.put_nowait([command, file])
-
-    for _ in threads: q.put_nowait(None) # signal no more files
-    for t in threads: t.join() # wait for completion
+    try:
+        load_table(attributesController.con, area_id, p, lon, lat, m, d, attributes, manifest["attribute_types"])
+    except Exception as e:
+        attributesController.con.rollback()
+        try:
+            attributesController.remove_dataset(area_name)
+            what = "removed the dataset"
+        except Exception as e2:
+            what = "removing the dataset failed too: %s" % e2
+        attributesController.close()
+        fail("loading the points into table %s failed: %s; %s" % (area_id, e, what))
     timing["load"] = time.time() - t0
 
     # a load that silently lost points fails the ingest; the m extents come from the same pass over the table
     t0 = time.time()
-    attributesController.connect()
     rows, m_min, m_max = rsi.rows_and_m_extents(attributesController.con, area_id)
     timing["rows_and_m_extents"] = time.time() - t0
     if rows != features:
@@ -218,32 +277,32 @@ def upload_json(folder_path, num_workers=1, store_root=rsi.DEFAULT_ROOT, store_t
         except Exception as e:
             what = "removing the partly loaded dataset failed too: %s" % e
         attributesController.close()
-        fail("the table got %d rows of the %d features in the chunk files; %s" % (rows, features, what))
+        fail("the table got %d rows of the %d points; %s" % (rows, features, what))
     print("Loaded %d points; m_min %s, m_max %s" % (rows, m_min, m_max))
     print("Indexing table")
     t0 = time.time()
     attributesController.index_table_on(area_id, "p", None)
+    mark_clustered(attributesController.con, area_id)
     timing["p_index"] = time.time() - t0
-    print("Clustering table")
-    t0 = time.time()
-    attributesController.cluster_table_using(area_id, area_id + "_p_idx")
-    timing["cluster"] = time.time() - t0
     attributesController.close()
 
     print("Building the recolor store in " + store_root)
     try:
-        store = rsi.build_and_check_store(int(area_id), area_name, rows, num_dates, num_extra,
+        store = rsi.build_and_check_store(int(area_id), area_name, rows, num_dates, num_extra, folder_path,
                                           rsi.dsn(dbHost, dbUsername), dbPassword, store_root, store_tools,
                                           min_free_gb)
     except rsi.StoreError as e:
         fail("%s. The dataset is loaded (area id %s) but the map can't show it without its store: after fixing the "
-             "cause, build it with tools/recolor_store/migrate.py --only %s of the insarmaps repository, or upload "
-             "the dataset again." % (e, area_id, area_id))
+             "cause, upload the dataset again, or build its store with tools/recolor_store/migrate.py --only %s of "
+             "the insarmaps repository." % (e, area_id, area_id))
     timing["store"] = store["build_s"]
     timing["check"] = store["check_s"]
-    print("Recolor store %s/%s: %d points x %d dates, %.1f MB, checked against the table (largest velocity "
-          "difference %.2g cm/yr)" % (store_root, area_id, store["points"], store["dates"], store["bytes"] / 1e6,
-                                      store["max_abs_diff_cm_per_yr"] or 0.0))
+    levels = store.get("levels_source") or {}
+    print("Recolor store %s/%s: %d points x %d dates, %.1f MB, drop rate %s and base zoom %s, checked against the "
+          "table (largest velocity difference %.2g cm/yr)" % (store_root, area_id, store["points"], store["dates"],
+                                                              store["bytes"] / 1e6, levels.get("rate"),
+                                                              levels.get("base_zoom"),
+                                                              store["max_abs_diff_cm_per_yr"] or 0.0))
     print("Seconds: " + ", ".join("%s %.1f" % (k, v) for k, v in timing.items()) +
           ", total %.1f" % (time.time() - t_start))
 
@@ -266,12 +325,14 @@ def non_negative(text):
 
 def build_parser():
     dbHost = "insarmaps.rsmas.miami.edu"
-    parser = argparse.ArgumentParser(description='Upload a dataset (the metadata.pickle and chunk_*.json that '
+    parser = argparse.ArgumentParser(description='Upload a dataset (the metadata.pickle and points that '
         'hdfeos5_2json_mbtiles.py or hdfeos5_or_csv_2json_mbtiles.py wrote) into the insarmaps database and build '
         'its recolor store, from which the map draws it; or remove or list datasets.')
-    parser.add_argument("--num-workers", help="Number of simultaneous processes to run for ingest.", required=False, default=1, type=int)
-    parser.add_argument("--json_folder", help="folder containing json to upload.", required=False)
-    parser.add_argument("json_folder_positional", help="folder containing json to upload.", nargs="?")
+    parser.add_argument("--num-workers", help="Not needed any more: the points load in one stream. Accepted for the "
+        "callers that still pass it.", required=False, default=1, type=int)
+    parser.add_argument("--json_folder", help="the folder step 1 wrote (metadata.pickle, points.json and its .npy "
+        "files)", required=False)
+    parser.add_argument("json_folder_positional", help="the folder step 1 wrote, as a positional argument", nargs="?")
     parser.add_argument("-U", "--server_user", required=False, 
         help="username for the insarmaps server (the machine where the tileserver and http server reside)")
     parser.add_argument("--remove",
@@ -305,12 +366,9 @@ def main():
     dbHost = parseArgs.host
 
     store_args = (parseArgs.recolor_store_root, parseArgs.recolor_tools, parseArgs.recolor_store_min_free_gb)
-    if parseArgs.json_folder:
-        print("Uploading json chunks...")
-        upload_json(parseArgs.json_folder, parseArgs.num_workers, *store_args)
-    elif parseArgs.json_folder_positional:
-        print("Uploading json chunks....")
-        upload_json(parseArgs.json_folder_positional, parseArgs.num_workers, *store_args)
+    if parseArgs.json_folder or parseArgs.json_folder_positional:
+        print("Uploading points...")
+        upload_points(parseArgs.json_folder or parseArgs.json_folder_positional, *store_args)
 
     dbController = InsarDatasetController(dbUsername,
                                          dbPassword,

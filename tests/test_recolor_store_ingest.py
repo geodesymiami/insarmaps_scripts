@@ -15,12 +15,6 @@ import recolor_store_ingest as rsi  # noqa: E402
 BUILD = 'ab' * 16
 
 
-def feature(p, d, m=0.001, **props):
-    """one line of a chunk file, as the ingest scripts write it"""
-    return json.dumps({'type': 'Feature', 'geometry': {'type': 'Point', 'coordinates': [-91.1, -0.8]},
-                       'properties': dict({'d': d, 'm': m, 'p': p}, **props)})
-
-
 def make_store(root, area_id, name='DS', build=BUILD, meta=True):
     d = os.path.join(root, str(area_id))
     os.mkdir(d)
@@ -56,18 +50,6 @@ class ChunkFiles(TempDirs):
             self.write(name, '')
         os.mkdir(os.path.join(self.dir, 'folder.json'))
         self.assertEqual(rsi.json_chunk_files(self.dir), ['chunk_0.json', 'chunk_1.json', 'chunk_10.json'])
-
-    def test_one_feature_per_non_blank_line(self):
-        # as the scripts write them: lines joined by newlines, none after the last
-        self.write('chunk_0.json', '\n'.join([feature(0, [0.0, 1.0]), feature(1, [0.0, 2.0])]))
-        self.write('chunk_1.json', feature(2, [0.0, 3.0]) + '\n\n' + feature(3, [0.0, 4.0]) + '\n')
-        self.assertEqual(rsi.count_features(self.dir, ['chunk_0.json', 'chunk_1.json']), 4)
-
-    def test_extra_properties_of_the_first_feature(self):
-        self.write('chunk_0.json', feature(0, [0.0], coherence=0.9, point_ID=7, dem_error=None))
-        self.assertEqual(rsi.extra_properties(self.dir, ['chunk_0.json']), 3)
-        self.write('chunk_1.json', feature(0, [0.0]))
-        self.assertEqual(rsi.extra_properties(self.dir, ['chunk_1.json']), 0)
 
     def test_dates_of_the_metadata(self):
         self.assertEqual(rsi.dates_in_metadata({'decimal_dates_sql': '{2016.4,2016.5,2016.6}'}), 3)
@@ -118,14 +100,14 @@ class Root(TempDirs):
             rsi.check_root(os.path.join(self.root, 'missing'), tools)
         with self.assertRaises(rsi.StoreError):
             rsi.check_root(self.root, tools)                 # no tools there
-        for name in ('convert_from_postgres.py', 'check_against_postgres.py'):
+        for name in ('convert_from_points.py', 'check_against_postgres.py'):
             open(os.path.join(tools, name), 'w').close()
         rsi.check_root(self.root, tools)
 
     @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root can write anywhere')
     def test_check_root_not_writable(self):
         tools = self.tempdir()
-        for name in ('convert_from_postgres.py', 'check_against_postgres.py'):
+        for name in ('convert_from_points.py', 'check_against_postgres.py'):
             open(os.path.join(tools, name), 'w').close()
         os.chmod(self.root, 0o555)
         self.addCleanup(os.chmod, self.root, 0o755)
@@ -256,7 +238,7 @@ class Build(TempDirs):
     def setUp(self):
         self.root = self.tempdir()
         self.tools = self.tempdir()
-        for tool, name in (('convert', 'convert_from_postgres.py'), ('check', 'check_against_postgres.py')):
+        for tool, name in (('convert', 'convert_from_points.py'), ('check', 'check_against_postgres.py')):
             with open(os.path.join(self.tools, name), 'w') as f:
                 f.write(f'TOOL = {tool!r}\n' + textwrap.dedent(STUB))
         self.record = os.path.join(self.tempdir(), 'calls.jsonl')
@@ -265,10 +247,11 @@ class Build(TempDirs):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.conninfo = rsi.dsn('127.0.0.1', 'insaradmin')
+        self.points = self.tempdir()                   # the folder step 1 wrote
 
     def build(self, min_free_gb=0.0):
-        return rsi.build_and_check_store(5, 'DS', 3, 2, 0, self.conninfo, 'secret-pw', self.root, self.tools,
-                                         min_free_gb)
+        return rsi.build_and_check_store(5, 'DS', 3, 2, 0, self.points, self.conninfo, 'secret-pw', self.root,
+                                         self.tools, min_free_gb)
 
     def calls(self):
         if not os.path.exists(self.record):
@@ -281,7 +264,7 @@ class Build(TempDirs):
         self.assertEqual((out['area_id'], out['build'], out['points'], out['dates'], out['bytes']),
                          (5, 'cd' * 16, 3, 2, 1234))
         convert, check = self.calls()
-        self.assertEqual(convert['argv'], ['5', '--root', self.root, '--no-mbtiles', '--replace', '--dsn',
+        self.assertEqual(convert['argv'], ['5', '--root', self.root, '--points', self.points, '--replace', '--dsn',
                                            self.conninfo])
         self.assertEqual(check['argv'], [os.path.join(self.root, '5'), '--dsn', self.conninfo])
         for call in (convert, check):                 # the password goes in the environment, not the command line
@@ -303,7 +286,7 @@ class Build(TempDirs):
 
     def test_an_empty_password_overrides_an_inherited_one(self):
         with mock.patch.dict(os.environ, {'PGPASSWORD': 'inherited'}):
-            rsi.build_and_check_store(5, 'DS', 3, 2, 0, self.conninfo, '', self.root, self.tools, 0.0)
+            rsi.build_and_check_store(5, 'DS', 3, 2, 0, self.points, self.conninfo, '', self.root, self.tools, 0.0)
         self.assertEqual([c['pgpassword'] for c in self.calls()], ['', ''])
 
     def test_a_store_that_fails_its_check_is_removed(self):

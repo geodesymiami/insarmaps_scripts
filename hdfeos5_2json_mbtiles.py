@@ -10,10 +10,8 @@ import os
 import sys
 import argparse
 import pickle
-import json
 import time
 from datetime import date
-import math
 import geocoder
 import numpy as np
 
@@ -21,21 +19,18 @@ from mintpy.objects import HDFEOS
 from mintpy.mask import mask_matrix
 from mintpy.utils import utils as ut
 import h5py
-import multiprocessing as mp
-from multiprocessing import shared_memory
-from multiprocessing import Pool
-from multiprocessing import Value
 
-chunk_num = Value("i", 0)
-# ex: python Converter_unavco.py Alos_SM_73_2980_2990_20070107_20110420.h5
+import points_bundle
 
-# This script takes a UNAVCO format timeseries h5 file and converts it to JSON chunk files and metadata.pickle,
-# which json_mbtiles2insarmaps.py loads into the database and turns into the dataset's recolor store
+# ex: hdfeos5_2json_mbtiles.py Alos_SM_73_2980_2990_20070107_20110420.he5 JSON
+
+# This script takes a UNAVCO format timeseries h5 file and writes the dataset's points as arrays (points_bundle.py)
+# and metadata.pickle, which json_mbtiles2insarmaps.py loads into the database and turns into the dataset's recolor
+# store. The name stays because minsar calls the script by it.
 # ---------------------------------------------------------------------------------------
 # FUNCTIONS
 # ---------------------------------------------------------------------------------------
-# returns a dictionary of datasets that are stored in memory to speed up h5 read process
-def get_date(date_string): 
+def get_date(date_string):
     year = int(date_string[0:4])
     month = int(date_string[4:6])
     day = int(date_string[6:8])
@@ -80,92 +75,9 @@ def get_attribute_or_remove_from_needed(needed_attributes, attributes, attribute
 
     return val
 
-def generate_worker_args(decimal_dates, timeseries_datasets, dates, json_path, folder_name, chunk_size, lats, lons, num_columns, num_rows):
-    num_points = num_columns * num_rows
-
-    worker_args = []
-    start = 0
-    end = 0
-    idx = 0
-    for i in range(num_points // chunk_size):
-        start = idx * chunk_size
-        end = (idx + 1) * chunk_size
-        if end > num_points:
-            end = num_points
-        args = [decimal_dates, timeseries_datasets, dates, json_path, folder_name, (start, end - 1), num_columns, num_rows, lats, lons]
-        worker_args.append(tuple(args))
-        idx += 1
-
-    if num_points % chunk_size != 0:
-        start = end
-        end = num_points
-        args = [decimal_dates, timeseries_datasets, dates, json_path, folder_name, (start, end - 1), num_columns, num_rows, lats, lons]
-        worker_args.append(tuple(args))
-
-    return worker_args
-
-def create_json(decimal_dates, timeseries_datasets, dates, json_path, folder_name, work_idxs, num_columns, num_rows, lats=None, lons=None):
-    global chunk_num
-    # create a siu_man array to store json point objects
-    siu_man = []
-    displacement_values = []
-    displacements = '{'
-    # np array of decimal dates, x parameter in linear regression equation
-    x = decimal_dates
-    A = np.vstack([x, np.ones(len(x))]).T
-    y = []
-    point_num = work_idxs[0]
-    # iterate through h5 file timeseries
-    for (row, col), value in np.ndenumerate(timeseries_datasets[dates[0]]):
-        cur_iter_point_num = row * num_columns + col
-        if cur_iter_point_num < work_idxs[0]:
-            continue
-        elif cur_iter_point_num > work_idxs[1]:
-            break
-
-        longitude = float(lons[row][col])
-        latitude = float(lats[row][col])
-        displacement = float(value) 
-        # if value is not equal to naN, create a new json point object and append to siu_man array
-        if not math.isnan(displacement):
-            # get displacement values for all the dates into array for json and string for pgsql
-            for datei in dates:
-                displacement = timeseries_datasets[datei][row][col]
-                displacements += (str(displacement) + ",")
-                displacement_values.append(float(displacement))
-            displacements = displacements[:len(displacements) - 1] + '}'
-
-            # np array of displacement values, y parameter in linear regression equation
-            y = displacement_values
-
-            # y = mx + c -> we want m = slope of the linear regression line 
-            m, c = np.linalg.lstsq(A, y, rcond=None)[0]
-
-            data = {
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [longitude, latitude]},    
-            "properties": {"d": displacement_values, "m": m, "p": point_num}
-            }   
-
-            siu_man.append(data)
-
-            # clear displacement array for json and the other string for dictionary, for next point
-            displacement_values = []
-            displacements = '{'
-            point_num += 1
-
-    if len(siu_man) > 0:
-        chunk_num_val = -1
-        with chunk_num.get_lock():
-            chunk_num_val = chunk_num.value
-            chunk_num.value += 1
-
-        make_json_file(chunk_num_val, siu_man, dates, json_path, folder_name)
-        siu_man = []
-
 # ---------------------------------------------------------------------------------------
-# convert h5 file to json and upload it. folder_name == unavco_name
-def convert_data(attributes, decimal_dates, timeseries_datasets, dates, json_path, folder_name, lats=None, lons=None, num_workers=1):
+# write metadata.pickle, from which json_mbtiles2insarmaps.py makes the dataset's area row. folder_name == unavco_name
+def write_metadata(attributes, decimal_dates, dates, json_path, folder_name, lats=None, lons=None):
 
     project_name = attributes["PROJECT_NAME"]
     region = region_name_from_project_name(project_name)
@@ -188,11 +100,6 @@ def convert_data(attributes, decimal_dates, timeseries_datasets, dates, json_pat
     print("rows: %d" % num_rows)
     if lats is None and lons is None:
         lats, lons = ut.get_lat_lon(attributes, dimension=1)
-
-    CHUNK_SIZE = 20000
-    process_pool = Pool(num_workers)
-    process_pool.starmap(create_json, generate_worker_args(decimal_dates, timeseries_datasets, dates, json_path, folder_name, CHUNK_SIZE, lats, lons, num_columns, num_rows))
-    process_pool.close()
 
     # dictionary to contain metadata needed by db to be written to a file
     # and then be read by json_mbtiles2insarmaps.py
@@ -252,24 +159,10 @@ def convert_data(attributes, decimal_dates, timeseries_datasets, dates, json_pat
     insarmapsMetadata["decimal_dates_sql"] = decimal_dates_sql
     insarmapsMetadata["attributes"] = attributes
     insarmapsMetadata["needed_attributes"] = needed_attributes
-    metadataFilePath = json_path + "/metadata.pickle" 
+    metadataFilePath = json_path + "/metadata.pickle"
     serialize_dictionary(insarmapsMetadata, metadataFilePath)
     return
 
-
-# ---------------------------------------------------------------------------------------
-# create a json file out of siu man array
-# then put json file into directory named after the h5 file
-def make_json_file(chunk_num, points, dates, json_path, folder_name):
-    chunk = "chunk_" + str(chunk_num) + ".json"
-    json_file = open(json_path + "/" + chunk, "w")
-    json_features = [json.dumps(feature) for feature in points]
-    string_json = '\n'.join(json_features)
-    json_file.write("%s" % string_json)
-    json_file.close()
-
-    print("converted chunk " + str(chunk_num))
-    return chunk
 
 def high_res_mode(attributes):
     high_res = False # default
@@ -283,11 +176,16 @@ def high_res_mode(attributes):
 
 # ---------------------------------------------------------------------------------------
 def build_parser():
-    parser = argparse.ArgumentParser(description='Convert a Unavco format H5 file for ingestion into insarmaps.', epilog="This program creates json chunk files which together comprise the whole dataset, and metadata.pickle. json_mbtiles2insarmaps.py uploads them and builds the dataset's recolor store, from which the map draws it.")
-    parser.add_argument("--num-workers", help="Number of simultaneous processes to run for ingest.", required=False, default=1, type=int)
+    parser = argparse.ArgumentParser(
+        description='Convert a Unavco format H5 file for ingestion into insarmaps.',
+        epilog="This program writes the dataset's points as arrays (points.json, p.npy, lon.npy, lat.npy, m.npy, "
+               "d.npy) and metadata.pickle. json_mbtiles2insarmaps.py loads them into the database and builds the "
+               "dataset's recolor store, from which the map draws it.")
+    parser.add_argument("--num-workers", help="Not needed any more: the conversion runs in one process. Accepted for "
+                        "the callers that still pass it.", required=False, default=1, type=int)
     required = parser.add_argument_group("required arguments")
     required.add_argument("file", help="unavco file to ingest")
-    required.add_argument("outputDir", help="directory to place the json files and metadata.pickle")
+    required.add_argument("outputDir", help="directory to place the points files and metadata.pickle")
 
     return parser
 
@@ -307,8 +205,7 @@ def main():
     # start clock to track how long conversion process takes
     start_time = time.perf_counter()
 
-    # use h5py to open specified group(s) in the h5 file 
-    # then read datasets from h5 file into memory for faster reading of data
+    # read the displacement and the mask, and mask the displacement (masked cells become NaN)
     he_obj = HDFEOS(file_name)
     he_obj.open(print_msg=False)
     displacement_3d_matrix = he_obj.read(datasetName='displacement')
@@ -318,54 +215,9 @@ def main():
         displacement_3d_matrix = mask_matrix(displacement_3d_matrix, mask)
     del mask
 
-    print("Creating shared memory for multiple processes")
-    shm = shared_memory.SharedMemory(create=True, size=displacement_3d_matrix.nbytes)
-    shared_displacement_3d_matrix = np.ndarray(displacement_3d_matrix.shape, dtype=displacement_3d_matrix.dtype, buffer=shm.buf)
-    shared_displacement_3d_matrix[:] = displacement_3d_matrix[:]
-    del displacement_3d_matrix
-    displacement_3d_matrix = shared_displacement_3d_matrix
-
     dates = he_obj.dateList
     attributes = dict(he_obj.metadata)
-
-    #file = h5py.File(file_name,  "r")
-    #timeseries_group = file["HDFEOS"]["GRIDS"]["timeseries"]
-    #displacement_3d_matrix = timeseries_group["observation"]["displacement"]
-
-    # get attributes (stored at root) of UNAVCO timeseries file
-    #attributes = dict(file.attrs)
-
-    # in timeseries displacement_3d_matrix, there are datasets
-    # need to get datasets with dates - strings that can be converted to integers
-    #dates = displacement_3d_matrix.attrs["DATE_TIMESERIES"].split(" ")
-
-    # array that stores dates from dates that have been converted to decimal
-    decimal_dates = []
-
-    # read datasets in the group into a dictionary of 2d arrays and intialize decimal dates
-    timeseries_datasets = {}
-    num_date = len(dates)
-    for i in range(num_date):
-        timeseries_datasets[dates[i]] = np.squeeze(displacement_3d_matrix[i, :, :])
-        d = get_date(dates[i])
-        decimal = get_decimal_date(d)
-        decimal_dates.append(decimal)
-    del displacement_3d_matrix
-
-    #for displacement_2d_matrix in displacement_3d_matrix:
-    #    dataset = displacement_2d_matrix[:]
-    #    if should_mask:
-    #        print("Masking " + dates[i])
-    #        mask = timeseries_group["quality"]["mask"][:]
-    #        dataset = mask_matrix(dataset, mask)
-    #    timeseries_datasets[dates[i]] = dataset
-    #    d = get_date(dates[i])
-    #    decimal = get_decimal_date(d)
-    #    decimal_dates.append(decimal)
-    #    i += 1
-
-    # close h5 file
-    #file.close()
+    decimal_dates = [get_decimal_date(get_date(d)) for d in dates]
 
     path_list = path_name.split("/")
     folder_name = path_name.split("/")[len(path_list)-1]
@@ -377,17 +229,20 @@ def main():
 
     # read lat and long. MintPy doesn't seem to support this yet, so we use the raw
     # h5 file object
-    f = h5py.File(he_obj.file, "r")
-    lats = np.array(f["HDFEOS"]["GRIDS"]["timeseries"]["geometry"]["latitude"])
-    lons = np.array(f["HDFEOS"]["GRIDS"]["timeseries"]["geometry"]["longitude"])
+    with h5py.File(he_obj.file, "r") as f:
+        lats = np.array(f["HDFEOS"]["GRIDS"]["timeseries"]["geometry"]["latitude"])
+        lons = np.array(f["HDFEOS"]["GRIDS"]["timeseries"]["geometry"]["longitude"])
 
-    # read and convert the datasets, then write them into json files and insert into database
-    convert_data(attributes, decimal_dates, timeseries_datasets, dates, output_folder, folder_name, lats, lons, parseArgs.num_workers)
+    # the points: every cell with values at two dates or more, its velocity fitted over the dates it has
+    num_points = points_bundle.write_grid_points(output_folder, displacement_3d_matrix, lats, lons, decimal_dates)
+    print("points: %d of %d cells, %d dates" % (num_points, lats.size, len(dates)))
+    del displacement_3d_matrix
+    write_metadata(attributes, decimal_dates, dates, output_folder, folder_name, lats, lons)
     del lats
     del lons
 
     # ---------------------------------------------------------------------------------------
-    # check how long it took to read h5 file data and create json files
+    # check how long it took to read h5 file data and write the points
     end_time =  time.perf_counter()
     print(("time elapsed: " + str(end_time - start_time)))
     return

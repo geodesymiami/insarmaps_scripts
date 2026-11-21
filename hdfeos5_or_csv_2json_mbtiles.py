@@ -11,11 +11,9 @@ import re
 import sys
 import argparse
 import pickle
-import json
 import time
 from datetime import date
 from datetime import datetime
-import math
 import geocoder
 import numpy as np
 from pathlib import Path
@@ -24,20 +22,15 @@ from mintpy.objects import HDFEOS
 from mintpy.mask import mask_matrix
 from mintpy.utils import utils as ut
 import h5py
-from multiprocessing import shared_memory
-from multiprocessing import Pool
-from multiprocessing import Value
 
 import pandas as pd
 
-chunk_num = Value("i", 0)
+import points_bundle
 
 # Lat/lon column candidates (CSV). Keep in sync with minsar/insarmaps_utils/insarmaps_csv_geo.py
 # Matching is case-insensitive (EGMS uses latitude/longitude).
 LAT_CANDIDATES = ["Y_geocorr", "Latitude", "latitude", "Y", "ycoord"]
 LON_CANDIDATES = ["X_geocorr", "Longitude", "longitude", "X", "xcoord"]
-
-CHUNK_SIZE_DEFAULT = 20000
 
 # ---------------------------------------------------------------------------------------
 # FUNCTIONS
@@ -76,166 +69,39 @@ def serialize_dictionary(dictionary, fileName):
         pickle.dump(dictionary, file, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def flatten_to_1d(arr):
-    """Return a 1D float array view/copy; None stays None."""
-    if arr is None:
-        return None
-    return np.asarray(arr).reshape(-1)
+def integer_or_double(values):
+    """The point table's type for a column of numbers held as floats (NaN where missing): integer when every value
+    there is a whole number that fits int32, as ogr2ogr typed the JSON this script used to write, else double
+    precision."""
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if len(v) == 0 or (np.all(v == np.round(v)) and v.min() >= -2**31 and v.max() < 2**31):
+        return "integer"
+    return "double precision"
 
 
-def ensure_point_arrays(timeseries_datasets, lats, lons, quality_params=None):
-    """
-    Ensure timeseries, lat/lon, and quality arrays are 1D length n_points.
-    HDFEOS readers may still produce 2D slices; flatten row-major (C order).
-    """
-    lats_1d = flatten_to_1d(lats)
-    lons_1d = flatten_to_1d(lons)
-    ts_1d = {d: flatten_to_1d(arr) for d, arr in timeseries_datasets.items()}
-    quality_1d = None
-    if quality_params:
-        quality_1d = {k: flatten_to_1d(v) for k, v in quality_params.items()}
-    return ts_1d, lats_1d, lons_1d, quality_1d
+def write_csv_points(json_path, timeseries_data, lats, lons, decimal_dates, quality_params=None):
+    """Writes the points of a CSV (points_bundle.py): every row with values at two dates or more, numbered by its row
+    (p = row index), with its velocity fitted over the dates it has; quality_params {name: values per row} become
+    the table's attribute columns, in this order, with NULL where a value is missing. Returns P."""
+    timeseries_data = np.asarray(timeseries_data, dtype=np.float64)
+    rows = np.flatnonzero(np.isfinite(timeseries_data).sum(axis=1) >= 2)
+    if len(rows) == 0:
+        raise ValueError("no row of the CSV has values at two dates or more")
+    lon, lat = np.asarray(lons, dtype=np.float64)[rows], np.asarray(lats, dtype=np.float64)[rows]
+    bad = ~(np.isfinite(lon) & np.isfinite(lat) & (np.abs(lat) < 90))
+    if bad.any():
+        raise ValueError("%d rows with values have no position (latitude/longitude missing, or |latitude| >= 90), "
+                         "the first at CSV row %d (counting the first data row as 0)" % (bad.sum(), rows[bad][0]))
+    d = timeseries_data[rows]
+    m = points_bundle.fit_velocities(decimal_dates, d)
+    attributes = {name: np.asarray(v, dtype=np.float64)[rows] for name, v in (quality_params or {}).items()}
+    types = {"point_ID": integer_or_double(attributes["point_ID"])} if "point_ID" in attributes else {}
+    return points_bundle.write_points(json_path, rows, lon, lat, m, d, attributes, types)
 
 
-def generate_point_worker_args(
-    decimal_dates,
-    timeseries_datasets,
-    dates,
-    json_path,
-    folder_name,
-    chunk_size,
-    lats,
-    lons,
-    quality_params=None,
-):
-    """
-    Build argument tuples for worker processes that create JSON chunks.
-
-    Each tuple:
-      (decimal_dates, timeseries_datasets, dates, json_path, folder_name,
-       (start_index, end_index), lats, lons, quality_params)
-    Indices are inclusive over the 1D point arrays.
-    """
-    num_points = int(np.asarray(lats).size)
-    worker_args = []
-    start = 0
-    while start < num_points:
-        end = min(start + chunk_size, num_points) - 1
-        worker_args.append(
-            (
-                decimal_dates,
-                timeseries_datasets,
-                dates,
-                json_path,
-                folder_name,
-                (start, end),
-                lats,
-                lons,
-                quality_params,
-            )
-        )
-        start = end + 1
-    return worker_args
-
-
-def create_json(
-    decimal_dates,
-    timeseries_datasets,
-    dates,
-    json_path,
-    folder_name,
-    work_idxs,
-    lats=None,
-    lons=None,
-    quality_params=None,
-):
-    """
-    Create GeoJSON Point features for points in [start_idx, end_idx] (inclusive)
-    and write them to a chunk_<N>.json file.
-
-    timeseries_datasets[date], lats, lons, and quality arrays must be 1D.
-    Point id property ``p`` is the 1D index (CSV row or row-major flat HDFEOS index).
-    """
-    global chunk_num
-
-    siu_man = []
-    x_arr = np.asarray(decimal_dates, dtype=float)
-    start_idx, end_idx = work_idxs
-    first_slice = timeseries_datasets[dates[0]]
-
-    for i in range(start_idx, end_idx + 1):
-        displacement0 = float(first_slice[i])
-        if math.isnan(displacement0):
-            continue
-
-        longitude = float(lons[i])
-        latitude = float(lats[i])
-
-        displacement_values = []
-        for datei in dates:
-            val = timeseries_datasets[datei][i]
-            if not math.isnan(val):
-                displacement_values.append(float(val))
-            else:
-                displacement_values.append(None)
-
-        mask = np.array([v is not None for v in displacement_values], dtype=bool)
-        x_used = x_arr[mask]
-        y = np.asarray(displacement_values, dtype=float)[mask]
-
-        if y.size >= 2:
-            A = np.vstack([x_used, np.ones(x_used.size)]).T
-            m, _c = np.linalg.lstsq(A, y, rcond=None)[0]
-        else:
-            m = float("nan")
-
-        safe_properties = {"d": displacement_values, "m": m, "p": i}
-
-        if quality_params:
-            for key, arr in quality_params.items():
-                val = arr[i]
-
-                if key == "point_ID":
-                    if val is None or (
-                        isinstance(val, float) and (math.isnan(val) or not math.isfinite(val))
-                    ):
-                        continue
-                    safe_properties[key] = int(val)
-                    continue
-
-                if val is None or (isinstance(val, float) and math.isnan(val)):
-                    safe_properties[key] = None
-                else:
-                    safe_properties[key] = val
-
-        data = {
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [longitude, latitude]},
-            "properties": safe_properties,
-        }
-        siu_man.append(data)
-
-    if len(siu_man) > 0:
-        with chunk_num.get_lock():
-            chunk_num_val = chunk_num.value
-            chunk_num.value += 1
-        make_json_file(chunk_num_val, siu_man, dates, json_path, folder_name)
-
-
-def convert_data(
-    attributes,
-    decimal_dates,
-    timeseries_datasets,
-    dates,
-    json_path,
-    folder_name,
-    lats=None,
-    lons=None,
-    quality_params=None,
-    num_workers=1,
-    chunk_size=CHUNK_SIZE_DEFAULT,
-):
-    """Convert point (or flattened grid) timeseries to JSON chunks + metadata.pickle."""
+def write_metadata(attributes, decimal_dates, dates, json_path, folder_name, lats=None, lons=None):
+    """Write metadata.pickle, from which json_mbtiles2insarmaps.py makes the dataset's area row."""
     project_name = attributes["PROJECT_NAME"]
     region = region_name_from_project_name(project_name)
 
@@ -249,35 +115,6 @@ def convert_data(
 
     if lats is None and lons is None:
         lats, lons = ut.get_lat_lon(attributes, dimension=1)
-
-    timeseries_datasets, lats, lons, quality_params = ensure_point_arrays(
-        timeseries_datasets, lats, lons, quality_params
-    )
-    num_points = int(lats.size)
-    n_dates = len(dates)
-    worker_args = generate_point_worker_args(
-        decimal_dates,
-        timeseries_datasets,
-        dates,
-        json_path,
-        folder_name,
-        chunk_size,
-        lats,
-        lons,
-        quality_params,
-    )
-    num_chunks = len(worker_args)
-    print(
-        f"[INFO] JSON plan: {num_points} points × {n_dates} dates → "
-        f"{num_chunks} chunk file(s) (chunk_size={chunk_size}, num_workers={num_workers})"
-    )
-
-    with chunk_num.get_lock():
-        chunk_num.value = 0
-
-    process_pool = Pool(num_workers)
-    process_pool.starmap(create_json, worker_args)
-    process_pool.close()
 
     insarmapsMetadata = {}
     mid_lat = float(np.nanmean(lats))
@@ -326,17 +163,6 @@ def convert_data(
     serialize_dictionary(insarmapsMetadata, metadataFilePath)
 
 
-def make_json_file(chunk_num_val, points, dates, json_path, folder_name):
-    chunk = "chunk_" + str(chunk_num_val) + ".json"
-    json_file = open(json_path + "/" + chunk, "w")
-    json_features = [json.dumps(feature) for feature in points]
-    string_json = "\n".join(json_features)
-    json_file.write("%s" % string_json)
-    json_file.close()
-    print("converted chunk " + str(chunk_num_val))
-    return chunk
-
-
 def high_res_mode(attributes):
     """True when geographic X_STEP/Y_STEP are absent (radar-coded or point CSV)."""
     try:
@@ -350,12 +176,13 @@ def high_res_mode(attributes):
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line argument parser for hdfeos5_or_csv_2json_mbtiles.py."""
     example_text = """\
-This program creates JSON chunk files which together comprise the whole
-dataset, and metadata.pickle. json_mbtiles2insarmaps.py uploads them and builds
-the dataset's recolor store, from which the map draws it.
+This program writes the dataset's points as arrays (points.json, p.npy, lon.npy,
+lat.npy, m.npy, d.npy and attr_NAME.npy for a CSV's quality columns) and
+metadata.pickle. json_mbtiles2insarmaps.py uploads them and builds the dataset's
+recolor store, from which the map draws it.
 
 Examples:
-  hdfeos5_or_csv_2json_mbtiles.py mintpy/S1_IW1_128_0596_0597_20160605_XXXXXXXX_S00887_S00783_W091208_W091105.he5 mintpy/JSON --num-workers 3
+  hdfeos5_or_csv_2json_mbtiles.py mintpy/S1_IW1_128_0596_0597_20160605_XXXXXXXX_S00887_S00783_W091208_W091105.he5 mintpy/JSON
   hdfeos5_or_csv_2json_mbtiles.py sarvey_test.csv ./JSON
   hdfeos5_or_csv_2json_mbtiles.py NOAA_SNT_A_VERT_10_50m.csv ./JSON_NOAA
     """
@@ -368,7 +195,7 @@ Examples:
 
     parser.add_argument(
         "--num-workers",
-        help="Number of simultaneous processes to run for JSON creation.",
+        help="Not needed any more: the conversion runs in one process. Accepted for the callers that still pass it.",
         required=False,
         default=1,
         type=int,
@@ -376,7 +203,7 @@ Examples:
 
     required = parser.add_argument_group("required arguments")
     required.add_argument("file", help="(unavco) Input file to ingest (.he5 or .csv).")
-    required.add_argument("outputDir", help="Directory to place JSON chunk files and metadata.pickle.")
+    required.add_argument("outputDir", help="Directory to place the points files and metadata.pickle.")
     return parser
 
 
@@ -438,7 +265,7 @@ def add_data_footprint_attribute(attributes: dict, lats: np.ndarray, lons: np.nd
 
 
 def read_from_hdfeos5_file(file_name):
-    """Read HDFEOS5 and return 1D point arrays (row-major flatten of the 2D grid)."""
+    """Read HDFEOS5: the masked displacement (dates x rows x cols, NaN where masked) and the 2D lat/lon grids."""
     should_mask = True
 
     path_name_and_extension = os.path.basename(file_name).split(".")
@@ -453,37 +280,19 @@ def read_from_hdfeos5_file(file_name):
         displacement_3d_matrix = mask_matrix(displacement_3d_matrix, mask)
     del mask
 
-    print("Creating shared memory for multiple processes")
-    shm = shared_memory.SharedMemory(create=True, size=displacement_3d_matrix.nbytes)
-    shared_displacement_3d_matrix = np.ndarray(
-        displacement_3d_matrix.shape, dtype=displacement_3d_matrix.dtype, buffer=shm.buf
-    )
-    shared_displacement_3d_matrix[:] = displacement_3d_matrix[:]
-    del displacement_3d_matrix
-    displacement_3d_matrix = shared_displacement_3d_matrix
-
     dates = he_obj.dateList
     attributes = dict(he_obj.metadata)
-
-    decimal_dates = []
-    timeseries_datasets = {}
-    num_date = len(dates)
-    for i in range(num_date):
-        # Flatten row-major so p = row * WIDTH + col
-        timeseries_datasets[dates[i]] = np.squeeze(displacement_3d_matrix[i, :, :]).reshape(-1)
-        d = get_date(dates[i])
-        decimal_dates.append(get_decimal_date(d))
-    del displacement_3d_matrix
+    decimal_dates = [get_decimal_date(get_date(d)) for d in dates]
 
     path_list = path_name.split("/")
     folder_name = path_name.split("/")[len(path_list) - 1]
 
-    f = h5py.File(he_obj.file, "r")
-    lats = np.array(f["HDFEOS"]["GRIDS"]["timeseries"]["geometry"]["latitude"]).reshape(-1)
-    lons = np.array(f["HDFEOS"]["GRIDS"]["timeseries"]["geometry"]["longitude"]).reshape(-1)
+    with h5py.File(he_obj.file, "r") as f:
+        lats = np.array(f["HDFEOS"]["GRIDS"]["timeseries"]["geometry"]["latitude"])
+        lons = np.array(f["HDFEOS"]["GRIDS"]["timeseries"]["geometry"]["longitude"])
 
     attributes["collection"] = "hdfeos5"
-    return attributes, decimal_dates, timeseries_datasets, dates, folder_name, lats, lons, shm
+    return attributes, decimal_dates, displacement_3d_matrix, dates, folder_name, lats, lons
 
 
 def add_calculated_attributes(attributes: dict) -> None:
@@ -541,8 +350,8 @@ def read_from_csv_file(file_name):
 
     Returns
     -------
-    attributes, decimal_dates, timeseries_datasets, dates, folder_name,
-    lats, lons, shm (None), quality_params
+    attributes, decimal_dates, timeseries_data (rows x dates, m), dates, folder_name,
+    lats, lons, quality_params
     """
     df = pd.read_csv(file_name)
     df.columns = [c.strip() for c in df.columns]
@@ -578,8 +387,6 @@ def read_from_csv_file(file_name):
 
     num_points = len(df)
     decimal_dates = [get_decimal_date(get_date(d)) for d in dates]
-    # timeseries_data shape (n_points, n_dates) -> one 1D array per date
-    timeseries_datasets = {d: timeseries_data[:, i] for i, d in enumerate(dates)}
 
     attributes = {}
     attributes["PROJECT_NAME"] = "CSV_IMPORT"
@@ -647,11 +454,10 @@ def read_from_csv_file(file_name):
         quality_params["point_ID"] = pd.to_numeric(df["pid"], errors="coerce").to_numpy(dtype=float)
 
     folder_name = os.path.basename(file_name).split(".")[0]
-    shm = None
 
     print(" Check: read_from_csv_file output")
-    print(" - timeseries_datasets keys:", list(timeseries_datasets.keys())[:3], "...")
-    print(" - sample slice shape:", timeseries_datasets[dates[0]].shape)
+    print(" - dates:", dates[:3], "...")
+    print(" - values shape (rows, dates):", timeseries_data.shape)
     print(" - lats shape:", lats.shape)
     print(" - lons shape:", lons.shape)
     print(" - Number of dates:", len(dates))
@@ -660,12 +466,11 @@ def read_from_csv_file(file_name):
     return (
         attributes,
         decimal_dates,
-        timeseries_datasets,
+        timeseries_data,
         dates,
         folder_name,
         lats,
         lons,
-        shm,
         quality_params if quality_params else None,
     )
 
@@ -687,50 +492,29 @@ def main():
 
     suffix = file_path.suffix.lower()
     if suffix == ".he5":
-        (
-            attributes,
-            decimal_dates,
-            timeseries_datasets,
-            dates,
-            folder_name,
-            lats,
-            lons,
-            shm,
-        ) = read_from_hdfeos5_file(file_name)
-        quality_params = None
+        attributes, decimal_dates, displacement, dates, folder_name, lats, lons = read_from_hdfeos5_file(file_name)
+        # every cell with values at two dates or more, p = its flat index (row * WIDTH + col)
+        num_points = points_bundle.write_grid_points(output_folder, displacement, lats, lons, decimal_dates,
+                                                     numbering="flat")
+        del displacement
+        lats, lons = lats.reshape(-1), lons.reshape(-1)
     elif suffix == ".csv":
         (
             attributes,
             decimal_dates,
-            timeseries_datasets,
+            timeseries_data,
             dates,
             folder_name,
             lats,
             lons,
-            shm,
             quality_params,
         ) = read_from_csv_file(file_name)
+        num_points = write_csv_points(output_folder, timeseries_data, lats, lons, decimal_dates, quality_params)
     else:
         raise ValueError(f"The file '{file_path}' must have .he5 or .csv as extension.")
+    print(f"[INFO] points: {num_points} of {lats.size}, {len(dates)} dates")
 
-    convert_data(
-        attributes,
-        decimal_dates,
-        timeseries_datasets,
-        dates,
-        output_folder,
-        folder_name,
-        lats,
-        lons,
-        quality_params,
-        args.num_workers,
-    )
-
-    del lats
-    del lons
-    if shm is not None:
-        shm.close()
-        shm.unlink()
+    write_metadata(attributes, decimal_dates, dates, output_folder, folder_name, lats, lons)
 
     end_time = time.perf_counter()
     print("time elapsed: " + str(end_time - start_time))
