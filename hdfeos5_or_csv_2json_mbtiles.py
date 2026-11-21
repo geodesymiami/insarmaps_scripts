@@ -350,9 +350,9 @@ def high_res_mode(attributes):
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line argument parser for hdfeos5_or_csv_2json_mbtiles.py."""
     example_text = """\
-This program will create temporary JSON chunk files which, when concatenated
-together, comprise the whole dataset. Tippecanoe is used to convert these
-JSON chunks into an MBTiles file.
+This program creates JSON chunk files which together comprise the whole
+dataset, and metadata.pickle. json_mbtiles2insarmaps.py uploads them and builds
+the dataset's recolor store, from which the map draws it.
 
 Examples:
   hdfeos5_or_csv_2json_mbtiles.py mintpy/S1_IW1_128_0596_0597_20160605_XXXXXXXX_S00887_S00783_W091208_W091105.he5 mintpy/JSON --num-workers 3
@@ -376,7 +376,7 @@ Examples:
 
     required = parser.add_argument_group("required arguments")
     required.add_argument("file", help="(unavco) Input file to ingest (.he5 or .csv).")
-    required.add_argument("outputDir", help="Directory to place JSON chunk files and MBTiles output.")
+    required.add_argument("outputDir", help="Directory to place JSON chunk files and metadata.pickle.")
     return parser
 
 
@@ -731,25 +731,6 @@ def main():
     if shm is not None:
         shm.close()
         shm.unlink()
-
-    os.chdir(os.path.abspath(output_folder))
-
-    if high_res_mode(attributes):
-        cmd = (
-            "tippecanoe *.json -P -l chunk_1 -x d -pf -pk -o "
-            + folder_name
-            + ".mbtiles 2> tippecanoe_stderr.log"
-        )
-    else:
-        cmd = (
-            "tippecanoe *.json -P -l chunk_1 -x d -pf -pk "
-            "-Bg -d9 -D12 -g12 -r0 -o "
-            + folder_name
-            + ".mbtiles 2> tippecanoe_stderr.log"
-        )
-
-    print("Now running tippecanoe with command %s" % cmd)
-    os.system(cmd)
 
     end_time = time.perf_counter()
     print("time elapsed: " + str(end_time - start_time))

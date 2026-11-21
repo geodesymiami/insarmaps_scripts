@@ -5,11 +5,6 @@ USER root
 RUN apt-get update
 RUN apt-get install -y build-essential libsqlite3-dev zlib1g-dev gdal-bin python3 libpq-dev python3-dev python3-pip git tmux 
 
-RUN git clone https://github.com/felt/tippecanoe.git
-WORKDIR tippecanoe
-RUN make -j
-RUN make install
-
 WORKDIR /home/root
 RUN git clone https://github.com/insarlab/MintPy.git
 WORKDIR MintPy
