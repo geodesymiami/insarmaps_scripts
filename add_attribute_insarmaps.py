@@ -41,7 +41,7 @@ class InsarDatabaseController(object):
         except Exception as e:
             print("Error While Connecting")
             print(e)
-            sys.exit()
+            sys.exit(1)     # a failure: the ingest that called this must not look successful
 
     def close(self):
         self.con.close()
