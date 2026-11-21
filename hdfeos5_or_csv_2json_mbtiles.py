@@ -96,6 +96,10 @@ def write_csv_points(json_path, timeseries_data, lats, lons, decimal_dates, qual
     d = timeseries_data[rows]
     m = points_bundle.fit_velocities(decimal_dates, d)
     attributes = {name: np.asarray(v, dtype=np.float64)[rows] for name, v in (quality_params or {}).items()}
+    # the JSON this script wrote left point_ID out of a row without one, so a CSV with no numeric point_ID at all
+    # (EGMS's pid is text) got no point_ID column: the same here, rather than a column of NULLs
+    if "point_ID" in attributes and np.isnan(attributes["point_ID"]).all():
+        del attributes["point_ID"]
     types = {"point_ID": integer_or_double(attributes["point_ID"])} if "point_ID" in attributes else {}
     return points_bundle.write_points(json_path, rows, lon, lat, m, d, attributes, types)
 

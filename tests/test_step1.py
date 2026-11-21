@@ -137,5 +137,16 @@ class Step1(unittest.TestCase):
         self.assertEqual(m[1], old_fit(T[1:], d[1, 1:]))
 
 
+    def test_csv_without_a_numeric_point_id_gets_no_point_id_column(self):
+        csv = os.path.join(self.dir, 'EGMS_L2a_124_0851_IW1_VV_2020_2024_1.csv')
+        with open(csv, 'w') as f:                       # EGMS: pid is text, dates are digit columns
+            f.write('pid,latitude,longitude,height_ortho,temporal_coherence,20200104,20200110,20200116\n'
+                    '1Y9bj6a9w0,37.637,15.149,246.4,0.67,0.0,1.0,2.0\n'
+                    '1Y9bj6a9w1,37.638,15.150,250.1,0.71,0.0,-1.0,-2.0\n')
+        out = os.path.join(self.dir, 'JSON')
+        (manifest, p, lon, lat, m, d, attrs), meta = self.run_script(csv_script, [csv, out])
+        self.assertEqual(manifest['attributes'], ['elevation', 'coherence'])     # as the old JSON's properties
+        self.assertEqual(list(attrs['elevation']), [246.4, 250.1])
+
 if __name__ == '__main__':
     unittest.main()
