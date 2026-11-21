@@ -271,30 +271,6 @@ class InsarDatasetController(InsarDatabaseController):
 
         return curl
 
-    def upload_mbtiles(self, fileName):
-        curl = self.curl_login(self.serverUsername, self.serverPassword)
-
-        curl.setopt(curl.HTTPPOST, [('title', fileName), (('file', (curl.FORM_FILE, fileName)))])
-        uploadURL = self.host + "/WebServices/uploadMbtiles"
-        curl.setopt(curl.URL, uploadURL)
-
-        buffer = BytesIO()
-        curl.setopt(curl.WRITEFUNCTION, buffer.write)
-        #curl.setopt(curl.VERBOSE, 1)
-        curl.perform()
-
-        responseCode = curl.getinfo(pycurl.HTTP_CODE)
-        if responseCode == 200:
-            print("Successfully uploaded " + fileName)
-        elif responseCode == 302:
-            sys.stderr.write("Server redirected us... Please check username and password, and try again\n")
-        elif responseCode == 301:
-            sys.stderr.write("Server redirected us... Please check host address, and try again\n")
-        else:
-            sys.stderr.write("The server responded with code: " + str(responseCode) + "\n")
-            print(buffer.getvalue().decode('UTF-8'))
-
-
     def remove_mbtiles(self, fileName):
         curl = self.curl_login(self.serverUsername, self.serverPassword)
 

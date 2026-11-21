@@ -280,9 +280,6 @@ def build_parser():
         help="List datasets currently on the insarmaps website", required=False, action="store_true")
     parser.add_argument("-P", "--server_password", required=False,
         help="password for the insarmaps server (the machine where the tileserver and http server reside)")
-    parser.add_argument("--mbtiles_file", help="mbtiles file to upload", required=False)
-    parser.add_argument("mbtiles_file_positional",
-        help="mbtiles file to upload, as a positional argument", nargs="?")
     parser.add_argument("--recolor-store-root", default=rsi.DEFAULT_ROOT,
         help="folder of the datasets' recolor stores, where the insarmaps app reads them (default: "
              "$INSARMAPS_RECOLOR_STORE_DIR, else /data/insarmaps2/recolor_store; now %(default)s)")
@@ -321,22 +318,6 @@ def main():
                                          'pgis',
                                          parseArgs.server_user,
                                          parseArgs.server_password)
-
-    if parseArgs.mbtiles_file or parseArgs.mbtiles_file_positional:
-        if not parseArgs.server_user or not parseArgs.server_password:
-            sys.stderr.write("Error: credentials for the insarmaps server not provided")
-        elif parseArgs.mbtiles_file:
-            print("Uploading mbtiles...")
-            if os.path.isfile(parseArgs.mbtiles_file):
-                dbController.upload_mbtiles(parseArgs.mbtiles_file)
-            else:
-                print(parseArgs.mbtiles_file + " doesn't exist")
-        else:
-            print("Uploading mbtiles....")
-            if os.path.isfile(parseArgs.mbtiles_file_positional):
-                dbController.upload_mbtiles(parseArgs.mbtiles_file_positional)
-            else:
-                print(parseArgs.mbtiles_file_positional + " doesn't exist")
 
     removal_failed = False
     if parseArgs.remove:
