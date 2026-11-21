@@ -233,7 +233,8 @@ def rows_and_m_extents(con, area_id):
     transaction; returns (rows, m_min, m_max), the extents as written (None when the table has no m)."""
     cur = con.cursor()
     cur.execute('SET LOCAL extra_float_digits = 1')     # shortest round-trip text, whatever the server's default
-    cur.execute(ROWS_AND_M_EXTENTS.format(id=int(area_id)))
+    # the only value in this SQL is int(area_id), which can't carry SQL; a table name can't be a query parameter
+    cur.execute(ROWS_AND_M_EXTENTS.format(id=int(area_id)))  # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query
     n, lo, hi = cur.fetchone()
     con.commit()
     return int(n), lo, hi
@@ -254,7 +255,9 @@ def run_tool(script, args, password, python=None):
     env = dict(os.environ)
     if password is not None:            # also an empty one: never a PGPASSWORD inherited from the environment
         env['PGPASSWORD'] = password
-    p = subprocess.run([python or sys.executable, script] + list(args), capture_output=True, text=True, env=env)
+    # an argument list without a shell: the tool's path from --recolor-tools, then an area id, paths and a libpq
+    # connection string without the password
+    p = subprocess.run([python or sys.executable, script] + list(args), capture_output=True, text=True, env=env)  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
     report = None
     lines = [x for x in p.stdout.splitlines() if x.strip()]
     if lines:
