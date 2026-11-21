@@ -9,11 +9,17 @@ If you have Docker installed, simply run `./init_docker.sh && ./run_docker.sh` w
 ### Manual install
 The below install instructions have been tested on ubuntu 22.04. Installing on Windows/MacOS/other linux distributions will involve modifying the below commands to the equivalent ones on the target system.
 
-1. Install tippecanoe: https://github.com/mapbox/tippecanoe
-2. Install gdal: ```sudo apt-get install gdal-bin```
-3. Install Mintpy: https://github.com/insarlab/MintPy/blob/main/docs/installation.md
-4. Run `conda install -file environment.yml` to install non-python code (tippecanoe)
-5. Run `pip install -r requirements.txt` to install remaining requirements
+1. Install gdal: ```sudo apt-get install gdal-bin```
+2. Install Mintpy: https://github.com/insarlab/MintPy/blob/main/docs/installation.md
+3. Run `conda install -file environment.yml` to install non-python code (gdal, libpq)
+4. Run `pip install -r requirements.txt` to install remaining requirements
+
+## Converting a dataset: hdfeos5_2json_mbtiles.py, hdfeos5_or_csv_2json_mbtiles.py
+
+`hdfeos5_2json_mbtiles.py FILE.he5 DIR` and `hdfeos5_or_csv_2json_mbtiles.py FILE.he5|FILE.csv DIR` write the dataset to
+DIR as `chunk_*.json` (one GeoJSON Feature per point and line) and `metadata.pickle`. They no longer make a
+`.mbtiles`: the map draws a dataset only from its recolor store, which the upload builds. (The names stay, since minsar
+calls the scripts by them.)
 
 ## Uploading a dataset: json_mbtiles2insarmaps.py
 
@@ -49,7 +55,8 @@ The store needs:
 - numpy and psycopg2 in the Python that runs the script.
 
 `json_mbtiles2insarmaps.py --remove NAME -u DBUSER -p DBPASS --host HOST -U WEBUSER -P WEBPASS` removes a dataset: its
-table and rows, its recolor store and its .mbtiles; it exits with code 1 when that fails.
+table and rows, its recolor store and, for a dataset uploaded before the stores, its .mbtiles; it exits with code 1
+when that fails.
 
 ## Tests
 

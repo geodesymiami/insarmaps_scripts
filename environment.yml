@@ -6,7 +6,6 @@ dependencies:
   - gdal=3.6*            # Required for Mac
   - libgdal
   - mintpy
-  - tippecanoe
   - libpq
   - postgresql
   - psycopg2

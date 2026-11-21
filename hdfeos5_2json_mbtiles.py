@@ -29,8 +29,8 @@ from multiprocessing import Value
 chunk_num = Value("i", 0)
 # ex: python Converter_unavco.py Alos_SM_73_2980_2990_20070107_20110420.h5
 
-# This script takes a UNAVCO format timeseries h5 file, converts to mbtiles, 
-# and sends to database which allows website to make queries and display data
+# This script takes a UNAVCO format timeseries h5 file and converts it to JSON chunk files and metadata.pickle,
+# which json_mbtiles2insarmaps.py loads into the database and turns into the dataset's recolor store
 # ---------------------------------------------------------------------------------------
 # FUNCTIONS
 # ---------------------------------------------------------------------------------------
@@ -283,11 +283,11 @@ def high_res_mode(attributes):
 
 # ---------------------------------------------------------------------------------------
 def build_parser():
-    parser = argparse.ArgumentParser(description='Convert a Unavco format H5 file for ingestion into insarmaps.', epilog="This program will create temporary json chunk files which, when concatenated together, comprise the whole dataset. Tippecanoe is used for concatenating these chunk files into the mbtiles file which describes the whole dataset.")
+    parser = argparse.ArgumentParser(description='Convert a Unavco format H5 file for ingestion into insarmaps.', epilog="This program creates json chunk files which together comprise the whole dataset, and metadata.pickle. json_mbtiles2insarmaps.py uploads them and builds the dataset's recolor store, from which the map draws it.")
     parser.add_argument("--num-workers", help="Number of simultaneous processes to run for ingest.", required=False, default=1, type=int)
     required = parser.add_argument_group("required arguments")
     required.add_argument("file", help="unavco file to ingest")
-    required.add_argument("outputDir", help="directory to place json files and mbtiles file")
+    required.add_argument("outputDir", help="directory to place the json files and metadata.pickle")
 
     return parser
 
@@ -386,16 +386,6 @@ def main():
     del lats
     del lons
 
-    # run tippecanoe command to get mbtiles file
-    os.chdir(os.path.abspath(output_folder))
-    cmd = None
-    if high_res_mode(attributes):
-        cmd = "tippecanoe *.json -P -l chunk_1 -x d -pf -pk -o " + folder_name + ".mbtiles 2> tippecanoe_stderr.log"
-    else:
-        cmd = "tippecanoe *.json -P -l chunk_1 -x d -pf -pk -Bg -d9 -D12 -g12 -r0 -o " + folder_name + ".mbtiles 2> tippecanoe_stderr.log"
-
-    print("Now running tippecanoe with command %s" % cmd)
-    os.system(cmd)
     # ---------------------------------------------------------------------------------------
     # check how long it took to read h5 file data and create json files
     end_time =  time.perf_counter()
