@@ -15,3 +15,41 @@ The below install instructions have been tested on ubuntu 22.04. Installing on W
 4. Run `conda install -file environment.yml` to install non-python code (tippecanoe)
 5. Run `pip install -r requirements.txt` to install remaining requirements
 
+## Uploading a dataset: json_mbtiles2insarmaps.py
+
+`json_mbtiles2insarmaps.py --json_folder DIR -u DBUSER -p DBPASS --host HOST` uploads the dataset that
+`hdfeos5_2json_mbtiles.py` or `hdfeos5_or_csv_2json_mbtiles.py` wrote to DIR (`metadata.pickle` and `chunk_*.json`).
+It runs on the insarmaps server itself, where the database is (minsar's `ingest_insarmaps.bash` step 2 does this over
+ssh, with `--host 127.0.0.1`), and connects to port 5432 unless `PGPORT` names another.
+
+1. It removes a dataset of the same name, with its recolor store, then adds the dataset's row to `area` and loads the
+   chunk files into its point table with ogr2ogr.
+2. It checks that the table got every feature of the chunk files. If not, it removes the partly loaded dataset and
+   fails.
+3. It writes the dataset's `m_min` and `m_max` to `extra_attributes` (insarmaps `POST /preLoad` answers from them),
+   then indexes and clusters the table on `p`.
+4. It builds the dataset's recolor store (insarmaps `docs/recolor-store.md`), from which the map draws the dataset,
+   and checks it against the table. If the store can't be built or fails its check, the store is removed and the
+   upload fails; the dataset stays in the database, but the map can't show it until its store is built (insarmaps
+   `tools/recolor_store/migrate.py --only AREA_ID`, or an upload of the dataset again).
+
+It fails before it touches the database when there are no chunk files, the store folder is missing or not writable,
+the insarmaps tools are not there, or the store wouldn't leave `--recolor-store-min-free-gb` (20) free. It also
+refuses a store folder most of whose stores belong to datasets the database doesn't have: that is another database's
+folder (for example the live one, while uploading to a copy of the database).
+
+The store needs:
+
+- the insarmaps repository checked out beside this one, as minsar does (`$MINSAR_HOME/tools/insarmaps`): its
+  `tools/recolor_store` builds and checks the store (`--recolor-tools` names another copy);
+- the store folder, where the insarmaps app reads the stores: `$INSARMAPS_RECOLOR_STORE_DIR`, else
+  `/data/insarmaps2/recolor_store` (`--recolor-store-root` names another), writable by the user who uploads;
+- numpy and psycopg2 in the Python that runs the script.
+
+`json_mbtiles2insarmaps.py --remove NAME -u DBUSER -p DBPASS --host HOST -U WEBUSER -P WEBPASS` removes a dataset: its
+table and rows, its recolor store and its .mbtiles.
+
+## Tests
+
+From the repository's root, in the Python environment the scripts run in: `python3 -m unittest discover -s tests`.
+They need no database and no network.
