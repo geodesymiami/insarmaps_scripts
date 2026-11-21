@@ -184,12 +184,22 @@ class Upload(unittest.TestCase):
         self.clustered.assert_called_once_with(self.ctrl.con, '8')
         self.build.assert_called_once_with(
             8, 'DS', 3, 2, 0, self.dir, "host='127.0.0.1' dbname='pgis' user='insaradmin' connect_timeout=30", 'pw',
-            self.root, self.tools, 0.0)
+            self.root, self.tools, 0.0, drop_rate=None, base_zoom=None)
         self.assertIn('drop rate 2.5 and base zoom 14', out)
         self.assertIn('Seconds:', out)
         self.ctrl.remove_dataset.assert_not_called()                     # there was none
         with open(os.path.join(self.root, j.rsi.MARKER)) as f:
             self.assertEqual(json.load(f)['database'], '7419/pgis')       # the folder now names its database
+
+    def test_drop_rate_and_base_zoom_reach_the_store(self):
+        code, out, err = self.upload(drop_rate=1.5, base_zoom=10)
+        self.assertIsNone(code, err)
+        self.assertEqual(self.build.call_args.kwargs, {'drop_rate': 1.5, 'base_zoom': 10})
+        self.assertEqual(j.drop_rate_value('1'), 1.0)
+        self.assertEqual(j.base_zoom_value('12'), 12)
+        for f, bad in ((j.drop_rate_value, '0.5'), (j.base_zoom_value, '15'), (j.base_zoom_value, '-1')):
+            with self.assertRaises(Exception):
+                f(bad)
 
     def test_a_new_upload_removes_the_old_store(self):
         self.ctrl.get_dataset_id.side_effect = [7, 8]

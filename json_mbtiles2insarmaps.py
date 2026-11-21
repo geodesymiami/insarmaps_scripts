@@ -179,12 +179,13 @@ def mark_clustered(con, area_id):
     con.commit()
 
 def upload_points(folder_path, store_root=rsi.DEFAULT_ROOT, store_tools=rsi.DEFAULT_TOOLS,
-                  min_free_gb=rsi.DEFAULT_MIN_FREE_GB):
+                  min_free_gb=rsi.DEFAULT_MIN_FREE_GB, drop_rate=None, base_zoom=None):
     """Loads the dataset of folder_path (metadata.pickle and the points step 1 wrote, points_bundle.py) into the
     database, replacing a dataset of the same name, then builds and checks its recolor store in store_root. Exits
     with code 1, saying why, when the folder holds no points (the JSON chunk files of an older step 1 are not read any
     more), when the table doesn't hold every point (the partly loaded dataset is removed), or when the store can't be
-    built or fails its check (the dataset stays, without a store)."""
+    built or fails its check (the dataset stays, without a store). drop_rate and base_zoom, when given, replace the
+    dataset's settings of the store's drop rule (insarmaps docs/recolor-store.md section 5)."""
     global dbUsername, dbPassword, dbHost
     t_start = time.time()
     timing = {}
@@ -290,7 +291,7 @@ def upload_points(folder_path, store_root=rsi.DEFAULT_ROOT, store_tools=rsi.DEFA
     try:
         store = rsi.build_and_check_store(int(area_id), area_name, rows, num_dates, num_extra, folder_path,
                                           rsi.dsn(dbHost, dbUsername), dbPassword, store_root, store_tools,
-                                          min_free_gb)
+                                          min_free_gb, drop_rate=drop_rate, base_zoom=base_zoom)
     except rsi.StoreError as e:
         fail("%s. The dataset is loaded (area id %s) but the map can't show it without its store: after fixing the "
              "cause, upload the dataset again, or build its store with tools/recolor_store/migrate.py --only %s of "
@@ -316,6 +317,18 @@ def remove_dataset_and_store(dbController, unavco_name, store_root):
     dbController.remove_dataset(unavco_name)
     if area_id != -1 and rsi.remove_store(store_root, area_id, unavco_name):
         print("Removed its recolor store (area id %d)" % area_id)
+
+def drop_rate_value(text):
+    value = float(text)
+    if not value >= 1:
+        raise argparse.ArgumentTypeError("must be 1 or more (1 drops no point): %r" % text)
+    return value
+
+def base_zoom_value(text):
+    value = int(text)
+    if not 0 <= value <= 14:
+        raise argparse.ArgumentTypeError("must be 0..14: %r" % text)
+    return value
 
 def non_negative(text):
     value = float(text)
@@ -348,6 +361,11 @@ def build_parser():
         help="the insarmaps repository's tools/recolor_store (default: beside this repository, %(default)s)")
     parser.add_argument("--recolor-store-min-free-gb", type=non_negative, default=rsi.DEFAULT_MIN_FREE_GB,
         help="free space to keep on the store folder's file system (default %(default)s)")
+    parser.add_argument("--drop-rate", type=drop_rate_value,
+        help="how fast points drop out below the base zoom, as tippecanoe's -r (default 2.5; 1 drops none)")
+    parser.add_argument("--base-zoom", type=base_zoom_value,
+        help="the zoom from which the map shows every point, as tippecanoe's -B (default 12 for a geocoded "
+             "dataset, else 14)")
 
     required = parser.add_argument_group("required arguments")
     required.add_argument("-u", "--user", help="username for the insarmaps database", required=True)
@@ -368,7 +386,8 @@ def main():
     store_args = (parseArgs.recolor_store_root, parseArgs.recolor_tools, parseArgs.recolor_store_min_free_gb)
     if parseArgs.json_folder or parseArgs.json_folder_positional:
         print("Uploading points...")
-        upload_points(parseArgs.json_folder or parseArgs.json_folder_positional, *store_args)
+        upload_points(parseArgs.json_folder or parseArgs.json_folder_positional, *store_args,
+                      drop_rate=parseArgs.drop_rate, base_zoom=parseArgs.base_zoom)
 
     dbController = InsarDatasetController(dbUsername,
                                          dbPassword,

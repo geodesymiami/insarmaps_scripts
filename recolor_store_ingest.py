@@ -247,11 +247,12 @@ def run_tool(script, args, password, python=None):
 
 
 def build_and_check_store(area_id, unavco_name, points, dates, attributes, points_dir, conninfo, password,
-                          root=DEFAULT_ROOT, tools=DEFAULT_TOOLS, min_free_gb=DEFAULT_MIN_FREE_GB, python=None):
+                          root=DEFAULT_ROOT, tools=DEFAULT_TOOLS, min_free_gb=DEFAULT_MIN_FREE_GB, python=None,
+                          drop_rate=None, base_zoom=None):
     """Builds <root>/<area_id> from the points step 1 wrote in points_dir (convert_from_points.py, levels from
     tippecanoe's drop rule), then checks it against the point table (check_against_postgres.py). Raises StoreError
     when it can't be built, or when it fails its check, after removing it. Returns what was built and how long it
-    took."""
+    took. drop_rate and base_zoom, when given, go to convert_from_points.py (--drop-rate, --base-zoom)."""
     area_id = int(area_id)
     check_root(root, tools)
     store = os.path.join(root, str(area_id))
@@ -263,9 +264,11 @@ def build_and_check_store(area_id, unavco_name, points, dates, attributes, point
                              f'{ds.get("area_id")}): not replacing it. Is {root} the store root of this database?')
     check_space(root, estimate_store_bytes(points, dates, attributes), min_free_gb)
     t0 = time.time()
+    levels = (['--drop-rate', repr(float(drop_rate))] if drop_rate is not None else []) + \
+             (['--base-zoom', str(int(base_zoom))] if base_zoom is not None else [])
     code, out, err = run_tool(os.path.join(tools, 'convert_from_points.py'),
-                              [str(area_id), '--root', root, '--points', points_dir, '--replace', '--dsn', conninfo],
-                              password, python)
+                              [str(area_id), '--root', root, '--points', points_dir, '--replace', '--dsn', conninfo]
+                              + levels, password, python)
     built_s = time.time() - t0
     if code != 0 or not out:
         # a store the converter published before it failed has not been checked: not left for the app to serve

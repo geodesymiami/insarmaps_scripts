@@ -249,9 +249,9 @@ class Build(TempDirs):
         self.conninfo = rsi.dsn('127.0.0.1', 'insaradmin')
         self.points = self.tempdir()                   # the folder step 1 wrote
 
-    def build(self, min_free_gb=0.0):
+    def build(self, min_free_gb=0.0, **levels):
         return rsi.build_and_check_store(5, 'DS', 3, 2, 0, self.points, self.conninfo, 'secret-pw', self.root,
-                                         self.tools, min_free_gb)
+                                         self.tools, min_free_gb, **levels)
 
     def calls(self):
         if not os.path.exists(self.record):
@@ -271,6 +271,10 @@ class Build(TempDirs):
             self.assertEqual(call['pgpassword'], 'secret-pw')
             self.assertNotIn('secret-pw', ' '.join(call['argv']))
         self.assertTrue(os.path.isfile(os.path.join(self.root, '5', 'meta.json')))
+
+    def test_drop_rate_and_base_zoom_reach_the_converter(self):
+        self.build(drop_rate=1.5, base_zoom=10)
+        self.assertEqual(self.calls()[0]['argv'][-4:], ['--drop-rate', '1.5', '--base-zoom', '10'])
 
     def test_a_failed_build_raises(self):
         with mock.patch.dict(os.environ, {'STUB_CONVERT': 'fail'}):

@@ -51,8 +51,8 @@ ssh, with `--host 127.0.0.1`), and connects to port 5432 unless `PGPORT` names a
    order, so no rewrite is needed).
 4. It builds the dataset's recolor store (insarmaps `docs/recolor-store.md`), from which the map draws the dataset,
    from the same points (`tools/recolor_store/convert_from_points.py`), and checks it against the table. Points
-   drop out at low zooms as with tippecanoe's `-r 2.5` and base zoom 14, or base zoom 12 for a geocoded dataset.
-   If the store can't be built or fails its check, the store is
+   drop out at low zooms as with tippecanoe's `-r 2.5` and base zoom 14, or base zoom 12 for a geocoded dataset;
+   `--drop-rate` and `--base-zoom` choose others. If the store can't be built or fails its check, the store is
    removed and the upload fails; the dataset stays in the database, but the map can't show it until its store is
    built (an upload of the dataset again, or insarmaps `tools/recolor_store/migrate.py --only AREA_ID`).
 
