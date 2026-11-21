@@ -13,9 +13,13 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# the packages of the ingest's environment that add_attribute_insarmaps.py imports; any other import error fails
+OPTIONAL = {'psycopg2', 'pycurl', 'requests', 'mintpy', 'numpy'}
 try:
     import json_mbtiles2insarmaps as j
-except ImportError as e:     # not the ingest's environment
+except ImportError as e:
+    if (e.name or '').split('.')[0] not in OPTIONAL:
+        raise
     j = None
     IMPORT_ERROR = e
 
@@ -52,11 +56,11 @@ class Upload(unittest.TestCase):
             f.write(feature(2))
         self.ctrl = mock.MagicMock(name='controller')
         self.ctrl.get_dataset_id.side_effect = [-1, 8]           # no old dataset; the new one gets id 8
-        self.ctrl.remove_dataset.side_effect = [Exception('Dataset DS is not on insarmaps'), None]
         self.patch('InsarDatabaseController', return_value=self.ctrl)
         self.system = self.patch('os.system', target=j.os, return_value=0)
         self.rows = self.patch('rows_and_m_extents', target=j.rsi, return_value=(3, '0.001', '0.001'))
         self.area_ids = self.patch('area_ids', target=j.rsi, return_value={1, 2})
+        self.identity = self.patch('database_identity', target=j.rsi, return_value='7419/pgis')
         self.build = self.patch('build_and_check_store', target=j.rsi, return_value={
             'points': 3, 'dates': 2, 'bytes': 1234, 'max_abs_diff_cm_per_yr': 1e-9, 'build_s': 0.1, 'check_s': 0.1})
         self.j_globals = mock.patch.multiple(j, dbUsername='insaradmin', dbPassword='pw', dbHost='127.0.0.1')
@@ -90,13 +94,15 @@ class Upload(unittest.TestCase):
         self.rows.assert_called_once_with(self.ctrl.con, '8')
         self.ctrl.index_table_on.assert_called_once_with('8', 'p', None)
         self.ctrl.cluster_table_using.assert_called_once_with('8', '8_p_idx')
-        self.build.assert_called_once_with(8, 'DS', 3, 2, 0, "host='127.0.0.1' dbname='pgis' user='insaradmin'",
+        self.build.assert_called_once_with(8, 'DS', 3, 2, 0, "host='127.0.0.1' dbname='pgis' user='insaradmin' connect_timeout=30",
                                            'pw', self.root, self.tools, 0.0)
         self.assertIn('Seconds:', out)
+        self.ctrl.remove_dataset.assert_not_called()                     # there was none
+        with open(os.path.join(self.root, j.rsi.MARKER)) as f:
+            self.assertEqual(json.load(f)['database'], '7419/pgis')       # the folder now names its database
 
     def test_a_new_upload_removes_the_old_store(self):
         self.ctrl.get_dataset_id.side_effect = [7, 8]
-        self.ctrl.remove_dataset.side_effect = None
         make_store(self.root, 7, 'DS')
         code, out, err = self.upload()
         self.assertIsNone(code, err)
@@ -110,7 +116,7 @@ class Upload(unittest.TestCase):
         code, out, err = self.upload()
         self.assertEqual(code, 1)
         self.assertIn('2 rows of the 3 features', err)
-        self.assertEqual([c.args for c in self.ctrl.remove_dataset.call_args_list], [('DS',), ('DS',)])
+        self.assertEqual([c.args for c in self.ctrl.remove_dataset.call_args_list], [('DS',)])
         self.ctrl.index_table_on.assert_not_called()
         self.build.assert_not_called()
 
@@ -119,7 +125,7 @@ class Upload(unittest.TestCase):
         code, out, err = self.upload()
         self.assertEqual(code, 1)
         self.assertIn('migrate.py --only 8', err)
-        self.assertEqual(self.ctrl.remove_dataset.call_count, 1)        # only the clearing of an old upload
+        self.ctrl.remove_dataset.assert_not_called()                     # the loaded dataset stays
 
     def test_no_chunks_fails_before_the_database(self):
         for name in ('chunk_0.json', 'chunk_1.json'):
@@ -144,6 +150,39 @@ class Upload(unittest.TestCase):
         self.ctrl.remove_dataset.assert_not_called()
         self.assertEqual(len(os.listdir(self.root)), 30)
 
+    def test_a_failed_replacement_stops_before_uploading(self):
+        self.ctrl.get_dataset_id.side_effect = [7, 8]
+        self.ctrl.remove_dataset.side_effect = Exception('connection lost')
+        make_store(self.root, 7, 'DS')
+        code, out, err = self.upload()
+        self.assertEqual(code, 1)
+        self.assertIn('connection lost', err)
+        self.ctrl.insert_dataset_into_area_table.assert_not_called()
+        self.system.assert_not_called()
+        self.assertTrue(os.path.isdir(os.path.join(self.root, '7')))     # the old dataset's store stays with it
+
+    def test_the_replaced_store_counts_as_free_space(self):
+        self.ctrl.get_dataset_id.side_effect = [7, 8]
+        make_store(self.root, 7, 'DS')
+        with open(os.path.join(self.root, '7', 'ydm.f32'), 'wb') as f:
+            f.write(b'\0' * 5000)
+        old = j.rsi.store_bytes(os.path.join(self.root, '7'))
+        with mock.patch.object(j.rsi, 'check_space') as space:
+            code, out, err = self.upload()
+        self.assertIsNone(code, err)
+        self.assertEqual(space.call_args.args[1], j.rsi.estimate_store_bytes(3, 2, 0) - old)
+
+    def test_a_folder_of_another_database_fails_before_any_removal(self):
+        self.ctrl.get_dataset_id.side_effect = [7, 8]
+        make_store(self.root, 7, 'DS')
+        with open(os.path.join(self.root, j.rsi.MARKER), 'w') as f:
+            json.dump({'database': '1234/pgis'}, f)
+        code, out, err = self.upload()
+        self.assertEqual(code, 1)
+        self.assertIn('1234/pgis', err)
+        self.ctrl.remove_dataset.assert_not_called()
+        self.assertTrue(os.path.isdir(os.path.join(self.root, '7')))
+
     def test_remove_dataset_and_store(self):
         ctrl = mock.MagicMock()
         ctrl.get_dataset_id.return_value = 7
@@ -151,7 +190,7 @@ class Upload(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             j.remove_dataset_and_store(ctrl, 'DS', self.root)
         ctrl.remove_dataset.assert_called_once_with('DS')
-        self.assertEqual(os.listdir(self.root), [])
+        self.assertEqual(os.listdir(self.root), [j.rsi.MARKER])
 
 
 if __name__ == '__main__':

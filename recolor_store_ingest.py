@@ -30,6 +30,10 @@ DEFAULT_TOOLS = os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(_
 DEFAULT_MIN_FREE_GB = 20.0      # free space to keep on the store root's file system, as migrate.py keeps
 BLOCK = 16                      # the store's block of dates (docs/recolor-store.md section 2)
 HEX = re.compile(r'^[0-9a-f]+$')
+# in the store root: which database the stores belong to (its cluster's system identifier and its name), written
+# by the first upload or removal; the app and migrate.py ignore it (they read only <root>/<area_id>/)
+MARKER = '.insarmaps-database'
+CONNECT_TIMEOUT_S = 30
 
 # One pass over the point table: its row count, and m_min/m_max as PR #183 of insarmaps defines them: Postgres's own
 # min(m) and max(m) (NULLs ignored, NaN above every number, so one NaN m makes m_max NaN) as their shortest
@@ -138,6 +142,37 @@ def check_root_belongs(root, area_ids, min_stores=20):
                          f'with --recolor-store-root')
 
 
+def check_root_identity(root, identity):
+    """The store root records the database its stores belong to (MARKER): refuses a root that records another one,
+    and records this one in a root that has no record yet. Run after check_root_belongs, which also catches the
+    root of another database that has no record yet."""
+    path = os.path.join(root, MARKER)
+    try:
+        with open(path) as f:
+            recorded = json.load(f).get('database')
+    except FileNotFoundError:
+        recorded = None
+    except (OSError, ValueError, AttributeError) as e:
+        raise StoreError(f'{path} can not be read: {e}')
+    if recorded is None:
+        tmp = f'{path}.{os.getpid()}.tmp'
+        with open(tmp, 'w') as f:
+            json.dump({'database': identity, 'recorded': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                       'by': 'insarmaps_scripts json_mbtiles2insarmaps.py'}, f)
+            f.write('\n')
+        os.replace(tmp, path)
+    elif recorded != identity:
+        raise StoreError(f'{root} holds the stores of database {recorded}, not of this one ({identity}). Give this '
+                         f'database\'s store root with --recolor-store-root')
+
+
+def store_bytes(store_dir):
+    """The size of a store's files (0 without the directory)."""
+    if not os.path.isdir(store_dir):
+        return 0
+    return sum(e.stat().st_size for e in os.scandir(store_dir) if e.is_file())
+
+
 def estimate_store_bytes(points, dates, attributes=0):
     """An upper bound of a store's size (docs/recolor-store.md section 2; the bound migrate.py uses)."""
     nb = -(-dates // BLOCK) + 1
@@ -177,6 +212,14 @@ def remove_store(root, area_id, unavco_name=None):
 
 # ---------------------------------------------------------------------------------------------- the database
 
+def database_identity(cursor):
+    """The database's identity for MARKER: its cluster's system identifier (another cluster, such as a copy of the
+    database restored into a test server, has another) and its name."""
+    cursor.execute('SELECT system_identifier::text, current_database() FROM pg_control_system()')
+    sysid, name = cursor.fetchone()
+    return f'{sysid}/{name}'
+
+
 def area_ids(cursor):
     """The area ids that have a point table: the datasets a store can belong to. (Not every area row: a copy of the
     database may hold all the area rows but only a few point tables.)"""
@@ -201,7 +244,7 @@ def dsn(host, user, dbname='pgis'):
     and without a port, so that the tools connect where the ingest does (PGPORT, else 5432)."""
     def q(v):
         return "'" + str(v).replace('\\', '\\\\').replace("'", "\\'") + "'"
-    return f'host={q(host)} dbname={q(dbname)} user={q(user)}'
+    return f'host={q(host)} dbname={q(dbname)} user={q(user)} connect_timeout={CONNECT_TIMEOUT_S}'
 
 
 # ---------------------------------------------------------------------------------------------- building
@@ -209,7 +252,7 @@ def dsn(host, user, dbname='pgis'):
 def run_tool(script, args, password, python=None):
     """Runs one of the tools; returns (exit code, its last stdout line parsed as JSON or None, stderr)."""
     env = dict(os.environ)
-    if password:
+    if password is not None:            # also an empty one: never a PGPASSWORD inherited from the environment
         env['PGPASSWORD'] = password
     p = subprocess.run([python or sys.executable, script] + list(args), capture_output=True, text=True, env=env)
     report = None
@@ -243,6 +286,11 @@ def build_and_check_store(area_id, unavco_name, points, dates, attributes, conni
                               password, python)
     built_s = time.time() - t0
     if code != 0 or not out:
+        # a store the converter published before it failed has not been checked: not left for the app to serve
+        try:
+            remove_store(root, area_id, unavco_name)
+        except (StoreError, OSError):
+            pass
         raise StoreError(f'building the recolor store failed (exit code {code}): {err[-3000:]}')
     t1 = time.time()
     code, rep, err = run_tool(os.path.join(tools, 'check_against_postgres.py'), [store, '--dsn', conninfo],

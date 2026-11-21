@@ -121,27 +121,34 @@ def upload_json(folder_path, num_workers=1, store_root=rsi.DEFAULT_ROOT, store_t
     num_dates = rsi.dates_in_metadata(metadata)
     num_extra = rsi.extra_properties(folder_path, chunk_files)
     print("%s: %d features, %d dates, in %d chunk files" % (area_name, features, num_dates, len(chunk_files)))
-    # everything the recolor store needs is checked before the database is touched
+    # everything the recolor store needs is checked before anything changes
     try:
         rsi.check_root(store_root, store_tools)
-        rsi.check_space(store_root, rsi.estimate_store_bytes(features, num_dates, num_extra), min_free_gb)
     except rsi.StoreError as e:
         fail(str(e))
 
     attributesController = InsarDatabaseController(dbUsername, dbPassword, dbHost, 'pgis')
     attributesController.connect()
-    try:
-        rsi.check_root_belongs(store_root, rsi.area_ids(attributesController.cursor))
-    except rsi.StoreError as e:
-        fail(str(e))
-    print("Clearing old dataset, if it is there")
     old_id = attributesController.get_dataset_id(area_name)
     try:
-        attributesController.remove_dataset(area_name)
-    except Exception as e:
-        print(str(e))
-        old_id = -1
-
+        rsi.check_root_belongs(store_root, rsi.area_ids(attributesController.cursor))
+        rsi.check_root_identity(store_root, rsi.database_identity(attributesController.cursor))
+        attributesController.con.rollback()
+        # the store of the dataset this upload replaces is deleted first: its space counts as free
+        old_store = rsi.store_bytes(os.path.join(store_root, str(old_id))) if old_id != -1 else 0
+        rsi.check_space(store_root, rsi.estimate_store_bytes(features, num_dates, num_extra) - old_store,
+                        min_free_gb)
+    except rsi.StoreError as e:
+        fail(str(e))
+    if old_id == -1:
+        print("No dataset %s yet" % area_name)
+    else:
+        print("Removing the dataset's previous upload (area id %d)" % old_id)
+        try:
+            attributesController.remove_dataset(area_name)
+        except Exception as e:
+            fail("removing the previous upload of %s (area id %d) failed, so nothing was uploaded: %s"
+                 % (area_name, old_id, e))
     attributesController.close()
     # its store too: the new upload gets a new area id
     if old_id != -1:
@@ -244,10 +251,18 @@ def remove_dataset_and_store(dbController, unavco_name, store_root):
     """Removes a dataset from the database (its point table and its rows in area, extra_attributes and
     plot_attributes), then its recolor store. dbController: a connected InsarDatabaseController."""
     rsi.check_root_belongs(store_root, rsi.area_ids(dbController.cursor))
+    if os.path.isdir(store_root):
+        rsi.check_root_identity(store_root, rsi.database_identity(dbController.cursor))
     area_id = dbController.get_dataset_id(unavco_name)
     dbController.remove_dataset(unavco_name)
     if area_id != -1 and rsi.remove_store(store_root, area_id, unavco_name):
         print("Removed its recolor store (area id %d)" % area_id)
+
+def non_negative(text):
+    value = float(text)
+    if not value >= 0:
+        raise argparse.ArgumentTypeError("must be a number of GB, 0 or more: %r" % text)
+    return value
 
 def build_parser():
     dbHost = "insarmaps.rsmas.miami.edu"
@@ -273,7 +288,7 @@ def build_parser():
              "$INSARMAPS_RECOLOR_STORE_DIR, else /data/insarmaps2/recolor_store; now %(default)s)")
     parser.add_argument("--recolor-tools", default=rsi.DEFAULT_TOOLS,
         help="the insarmaps repository's tools/recolor_store (default: beside this repository, %(default)s)")
-    parser.add_argument("--recolor-store-min-free-gb", type=float, default=rsi.DEFAULT_MIN_FREE_GB,
+    parser.add_argument("--recolor-store-min-free-gb", type=non_negative, default=rsi.DEFAULT_MIN_FREE_GB,
         help="free space to keep on the store folder's file system (default %(default)s)")
 
     required = parser.add_argument_group("required arguments")
@@ -323,9 +338,11 @@ def main():
             else:
                 print(parseArgs.mbtiles_file_positional + " doesn't exist")
 
+    removal_failed = False
     if parseArgs.remove:
         if not parseArgs.server_user or not parseArgs.server_password:
-            sys.stderr.write("Error: credentials for the insarmaps server not provided")
+            sys.stderr.write("Error: credentials for the insarmaps server not provided\n")
+            removal_failed = True
         else:
             print("Trying to remove %s" % (parseArgs.remove))
             dbController.connect()
@@ -334,7 +351,8 @@ def main():
                 dbController.remove_mbtiles(parseArgs.remove + ".mbtiles")
                 print("Successfully removed %s" % (parseArgs.remove))
             except Exception as e:
-                print(str(e))
+                sys.stderr.write("Error: %s\n" % e)
+                removal_failed = True
 
             dbController.close()
 
@@ -343,6 +361,9 @@ def main():
         dbController.connect()
         dbController.list_dataset_names()
         dbController.close()
+
+    if removal_failed:
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()

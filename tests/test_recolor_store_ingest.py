@@ -145,6 +145,26 @@ class Root(TempDirs):
         rsi.check_root_belongs(small, set())                            # too few stores to tell
         rsi.check_root_belongs(os.path.join(self.root, 'missing'), set())
 
+    def test_the_root_records_its_database(self):
+        rsi.check_root_identity(self.root, '7419/pgis')                 # first use: recorded
+        with open(os.path.join(self.root, rsi.MARKER)) as f:
+            self.assertEqual(json.load(f)['database'], '7419/pgis')
+        rsi.check_root_identity(self.root, '7419/pgis')
+        with self.assertRaisesRegex(rsi.StoreError, '7419/pgis'):
+            rsi.check_root_identity(self.root, '1234/pgis')             # a copy of the database elsewhere
+        self.assertEqual(rsi.store_ids(self.root), [])                  # the record is not a store
+        self.assertEqual([n for n in os.listdir(self.root) if n.endswith('.tmp')], [])
+        with open(os.path.join(self.root, rsi.MARKER), 'w') as f:
+            f.write('{broken')
+        with self.assertRaises(rsi.StoreError):
+            rsi.check_root_identity(self.root, '7419/pgis')
+
+    def test_store_bytes(self):
+        make_store(self.root, 5)
+        d = os.path.join(self.root, '5')
+        self.assertEqual(rsi.store_bytes(d), sum(os.path.getsize(os.path.join(d, n)) for n in os.listdir(d)))
+        self.assertEqual(rsi.store_bytes(os.path.join(self.root, '6')), 0)
+
     def test_estimate_and_space(self):
         self.assertEqual(rsi.estimate_store_bytes(100, 20, 2), 100 * (24 + 4 * 20 + 18 * 3 + 8 * 2))
         rsi.check_space(self.root, 0, 0)
@@ -168,16 +188,24 @@ class FakeCursor:
 
 class Database(unittest.TestCase):
     def test_rows_and_m_extents_in_one_transaction(self):
-        cur = FakeCursor(one=(3, '-0.0123', 'NaN'))
+        cur = FakeCursor(one=(7, '-1.5', 'NaN'))
         con = mock.Mock()
         con.cursor.return_value = cur
-        self.assertEqual(rsi.rows_and_m_extents(con, '42'), (3, '-0.0123', 'NaN'))
+        self.assertEqual(rsi.rows_and_m_extents(con, '42'), (7, '-1.5', 'NaN'))
+        cur.one = (0, None, None)                                       # a table without m: no extents
+        self.assertEqual(rsi.rows_and_m_extents(con, '42'), (0, None, None))
+        cur.sql = cur.sql[:2]
         self.assertEqual(cur.sql[0], 'SET LOCAL extra_float_digits = 1')
         self.assertIn('FROM "42"', cur.sql[1])
         self.assertIn('area_id = 42', cur.sql[1])
         self.assertIn("('m_min', e.lo::text), ('m_max', e.hi::text)", cur.sql[1])
         self.assertIn('WHERE e.lo IS NOT NULL', cur.sql[1])
-        con.commit.assert_called_once_with()
+        self.assertEqual(con.commit.call_count, 2)
+
+    def test_database_identity(self):
+        cur = FakeCursor(one=('7419123', 'pgis'))
+        self.assertEqual(rsi.database_identity(cur), '7419123/pgis')
+        self.assertIn('pg_control_system()', cur.sql[0])
 
     def test_area_ids_are_those_with_a_point_table(self):
         cur = FakeCursor(rows=[(1,), (None,), (3,)])
@@ -185,8 +213,9 @@ class Database(unittest.TestCase):
         self.assertIn('JOIN pg_class c ON c.relname = a.id::text', cur.sql[0])
 
     def test_dsn_has_no_password_or_port(self):
-        self.assertEqual(rsi.dsn('127.0.0.1', 'insaradmin'), "host='127.0.0.1' dbname='pgis' user='insaradmin'")
-        self.assertEqual(rsi.dsn('h', "o'b\\x"), "host='h' dbname='pgis' user='o\\'b\\\\x'")
+        self.assertEqual(rsi.dsn('127.0.0.1', 'insaradmin'),
+                         "host='127.0.0.1' dbname='pgis' user='insaradmin' connect_timeout=30")
+        self.assertEqual(rsi.dsn('h', "o'b\\x"), "host='h' dbname='pgis' user='o\\'b\\\\x' connect_timeout=30")
 
 
 STUB = '''
@@ -198,6 +227,14 @@ mode = os.environ.get('STUB_' + TOOL.upper(), 'ok')
 if TOOL == 'convert':
     if mode == 'fail':
         sys.stderr.write('convert: boom\\n')
+        sys.exit(1)
+    if mode == 'publish_then_fail':
+        area_id = int(args[0])
+        d = os.path.join(args[args.index('--root') + 1], str(area_id))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'meta.json'), 'w') as f:
+            json.dump({'build': 'ef' * 16, 'dataset': {'area_id': area_id, 'unavco_name': os.environ['STUB_NAME']}}, f)
+        sys.stderr.write('convert: died after publishing\\n')
         sys.exit(1)
     area_id = int(args[0])
     d = os.path.join(args[args.index('--root') + 1], str(area_id))
@@ -257,6 +294,17 @@ class Build(TempDirs):
             with self.assertRaisesRegex(rsi.StoreError, 'boom'):
                 self.build()
         self.assertEqual([c['tool'] for c in self.calls()], ['convert'])
+
+    def test_a_store_published_by_a_failed_build_is_removed(self):
+        with mock.patch.dict(os.environ, {'STUB_CONVERT': 'publish_then_fail'}):
+            with self.assertRaisesRegex(rsi.StoreError, 'died after publishing'):
+                self.build()
+        self.assertEqual(os.listdir(self.root), [])
+
+    def test_an_empty_password_overrides_an_inherited_one(self):
+        with mock.patch.dict(os.environ, {'PGPASSWORD': 'inherited'}):
+            rsi.build_and_check_store(5, 'DS', 3, 2, 0, self.conninfo, '', self.root, self.tools, 0.0)
+        self.assertEqual([c['pgpassword'] for c in self.calls()], ['', ''])
 
     def test_a_store_that_fails_its_check_is_removed(self):
         with mock.patch.dict(os.environ, {'STUB_CHECK': 'fail'}):
