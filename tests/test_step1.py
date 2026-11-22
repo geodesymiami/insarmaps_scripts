@@ -1,9 +1,11 @@
 """Step 1 end to end on tiny inputs: insarmaps_ingester.py writes the points (points_bundle.py) and metadata.pickle, and
 nothing else: no JSON, no .mbtiles, no tippecanoe. An HDF-EOS5 file gets the points and metadata
-hdfeos5_2json_mbtiles.py wrote (with --he5-like-csv, what hdfeos5_or_csv_2json_mbtiles.py wrote for one), a CSV what
-hdfeos5_or_csv_2json_mbtiles.py wrote. No network (the country lookup is stubbed).
+hdfeos5_2json_mbtiles.py wrote (with --he5-like-csv, what hdfeos5_or_csv_2json_mbtiles.py wrote for one) and its
+temporal coherence as the points' attribute coherence, a CSV what hdfeos5_or_csv_2json_mbtiles.py wrote. No network
+(the country lookup is stubbed).
 Needs the ingest's Python environment (mintpy, h5py, pandas, geocoder). Run from the repository's root:
 python3 -m unittest discover -s tests"""
+import io
 import math
 import os
 import pickle
@@ -30,6 +32,11 @@ DATES = ['20200101', '20200113', '20200125']
 T = np.array([2020.0, 12 / 365.0 + 2020, 24 / 365.0 + 2020]) if ingester else None    # the scripts' decimal dates
 GRID = {'X_FIRST': '-91.10', 'Y_FIRST': '-0.80', 'X_STEP': '-0.01', 'Y_STEP': '-0.01'}
 CELLS = [k for k in range(12) if k != 1]            # write_he5's 12 cells but (0, 1), which is masked: its points
+# a temporalCoherence layer for write_he5, as MintPy writes one: low at the cell its mask hides, (0, 1); here also NaN
+# at the point (1, 2)
+COHERENCE = np.array([[0.91, 0.32, 0.88, 0.97],
+                      [0.75, 0.62, np.nan, 0.99],
+                      [0.58, 0.83, 0.95, 0.71]], dtype=np.float32) if ingester else None
 
 
 def old_fit(t, y):
@@ -37,9 +44,10 @@ def old_fit(t, y):
     return np.linalg.lstsq(np.vstack([t, np.ones(len(t))]).T, y, rcond=None)[0][0]
 
 
-def write_he5(path, extra_attributes=None):
+def write_he5(path, extra_attributes=None, coherence=None):
     """An HDF-EOS5 file of 3 x 4 cells and 3 dates, as MintPy writes it, radar-coded (no X_STEP) unless
-    extra_attributes adds GRID: cell (0, 1) masked, cell (2, 3) missing at the last date."""
+    extra_attributes adds GRID: cell (0, 1) masked, cell (2, 3) missing at the last date; coherence, when given, is
+    its temporalCoherence layer, which it has none of otherwise."""
     length, width = 3, 4
     disp = np.arange(len(DATES) * length * width, dtype=np.float32).reshape(len(DATES), length, width) / 1000
     disp[2, 2, 3] = np.nan
@@ -58,6 +66,8 @@ def write_he5(path, extra_attributes=None):
         g.create_dataset('observation/bperp', data=np.zeros(len(DATES), dtype=np.float32))
         g.create_dataset('observation/displacement', data=disp)
         g.create_dataset('quality/mask', data=mask)
+        if coherence is not None:
+            g.create_dataset('quality/temporalCoherence', data=coherence)
         g.create_dataset('geometry/latitude', data=lat.astype(np.float32))
         g.create_dataset('geometry/longitude', data=lon.astype(np.float32))
     return disp, lat.astype(np.float32), lon.astype(np.float32)
@@ -72,10 +82,12 @@ class Step1(unittest.TestCase):
         self.addCleanup(os.chdir, cwd)
 
     def run_script(self, args):
+        """Runs the script; returns the points and the metadata, and keeps what it printed in self.printed."""
         with mock.patch.object(sys, 'argv', ['insarmaps_ingester.py'] + args), \
                 mock.patch.object(ingester.geocoder, 'google', side_effect=RuntimeError('no network in tests')), \
-                mock.patch('os.system') as system:
+                mock.patch('os.system') as system, mock.patch('sys.stdout', new_callable=io.StringIO) as printed:
             ingester.main()
+        self.printed = printed.getvalue()
         system.assert_not_called()                      # tippecanoe or anything else
         out = args[1]
         names = sorted(os.listdir(out))
@@ -84,12 +96,14 @@ class Step1(unittest.TestCase):
         with open(os.path.join(out, 'metadata.pickle'), 'rb') as f:
             return pb.read_points(out), pickle.load(f)
 
-    def run_he5(self, extra_attributes=None, options=('--num-workers', '1')):
+    def run_he5(self, extra_attributes=None, options=('--num-workers', '1'), coherence=None):
         """Runs the script on write_he5's file; checks what every HDF-EOS5 run writes the same way and returns p, the
-        metadata, and the file's lat/lon grids."""
+        metadata, and the file's lat/lon grids. Keeps the manifest and the points' attributes in self.manifest and
+        self.attrs: none for a file without a temporalCoherence layer."""
         he5 = os.path.join(self.dir, 'S1_IW1_128_20200101_20200125.he5')
-        disp, lat, lon = write_he5(he5, extra_attributes)
+        disp, lat, lon = write_he5(he5, extra_attributes, coherence)
         (manifest, p, _, _, m, d, attrs), meta = self.run_script([he5, os.path.join(self.dir, 'JSON'), *options])
+        self.manifest, self.attrs = manifest, attrs
         self.assertEqual(meta['area'], 'S1_IW1_128_20200101_20200125')
         self.assertEqual(meta['string_dates_sql'], '{' + ','.join(DATES) + '}')
         self.assertEqual((manifest['points'], manifest['dates'], manifest['d_dtype']), (11, 3, 'float32'))
@@ -98,7 +112,9 @@ class Step1(unittest.TestCase):
         self.assertTrue(math.isnan(d[k, 2]))
         self.assertEqual(m[k], old_fit(T[:2], d[k, :2].astype(np.float64)))
         self.assertEqual(int(np.isnan(m).sum()), 0)     # every point's m is fitted over the dates it has
-        self.assertEqual(attrs, {})
+        if coherence is None:
+            self.assertEqual(attrs, {})
+            self.assertIn('temporal coherence: none in the file', self.printed)
         return list(p), meta, lat, lon
 
     def check_like_hdfeos5_2json_mbtiles(self, p, meta):
@@ -148,6 +164,37 @@ class Step1(unittest.TestCase):
         self.assertEqual(set(meta['attribute_keys'][:-1]), {'LENGTH', 'WIDTH', 'mission', 'REF_LAT', 'REF_LON',
                                                             'first_date', 'last_date', 'processing_software',
                                                             'unwrap_method', *GRID})
+
+    def test_he5_temporal_coherence_is_the_points_coherence(self):
+        """The points' attribute coherence is their cells' temporalCoherence, as the file holds it, NaN where a cell
+        has none, with either numbering; the masked cell's value is no point's."""
+        for options, numbers in ((('--num-workers', '1'), list(range(11))), (('--he5-like-csv',), CELLS)):
+            with self.subTest(options=options):
+                p, meta, _, _ = self.run_he5(GRID, options=options, coherence=COHERENCE)
+                self.assertEqual(p, numbers)
+                self.assertEqual(self.manifest['attributes'], ['coherence'])
+                self.assertEqual(self.manifest['attribute_types'], {'coherence': 'double precision'})
+                np.testing.assert_array_equal(self.attrs['coherence'],
+                                              COHERENCE.reshape(-1)[CELLS].astype(np.float64))
+                self.assertTrue(math.isnan(self.attrs['coherence'][CELLS.index(6)]))       # cell (1, 2)
+                self.assertNotIn(float(COHERENCE[0, 1]), list(self.attrs['coherence']))
+                self.assertIn('temporal coherence: kept as the points\' attribute coherence', self.printed)
+                self.assertNotIn('coherence', meta['attribute_keys'])           # not an attribute of the dataset
+
+    def test_he5_without_a_coherence_value_at_its_points_gets_no_coherence(self):
+        """No attribute when the file's temporalCoherence is all NaN (as in the horizontal and vertical
+        decompositions), has values only where no point is, or is not of the grid's shape."""
+        only_masked = np.full((3, 4), np.nan, dtype=np.float32)
+        only_masked[0, 1] = 0.32
+        for what, layer, message in (
+                ('all NaN', np.full((3, 4), np.nan, dtype=np.float32), 'temporal coherence: no point has a value'),
+                ('only where the mask hides the cell', only_masked, 'temporal coherence: no point has a value'),
+                ('of another shape', COHERENCE[:2], 'temporalCoherence is (2, 4), not the grid\'s (3, 4)')):
+            with self.subTest(what):
+                p, _, _, _ = self.run_he5(coherence=layer)
+                self.assertEqual(p, list(range(11)))
+                self.assertEqual((self.manifest['attributes'], self.attrs), ([], {}))
+                self.assertIn(message, self.printed)
 
     def test_csv(self):
         csv = os.path.join(self.dir, 'TSX_036_20200101_20200125_N2579W08019.csv')

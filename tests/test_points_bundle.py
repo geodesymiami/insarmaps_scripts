@@ -1,5 +1,6 @@
 """Tests of points_bundle.py, the points step 1 hands to step 2: numbering, the rule for missing values, the velocity
-fit, and the files (no database). Needs numpy. Run from the repository's root: python3 -m unittest discover -s tests"""
+fit, a grid's per-cell attributes, and the files (no database). Needs numpy. Run from the repository's root:
+python3 -m unittest discover -s tests"""
 import json
 import os
 import shutil
@@ -77,6 +78,44 @@ class Points(unittest.TestCase):
         np.testing.assert_array_equal(d, disp.reshape(4, -1)[:, idx].T)                   # the file's values
         np.testing.assert_array_equal(lon, lons.astype(np.float32).astype(np.float64).reshape(-1)[idx])
         self.assertTrue(np.isnan(d[0, 3]) and np.isfinite(m[0]))                           # the gap, and its fit
+
+    def test_grid_attributes_are_the_points_cells_values(self):
+        disp = grid()
+        disp[:, 0, 1] = np.nan                      # masked: its coherence is no point's
+        lats, lons = np.meshgrid(np.linspace(-0.8, -0.9, 3), np.linspace(-91.1, -91.2, 5), indexing='ij')
+        coherence = np.linspace(0.5, 0.99, 15, dtype=np.float32).reshape(3, 5)
+        coherence[1, 3] = np.nan                    # a point without a value
+        height = np.arange(15, dtype=np.float32).reshape(3, 5) * 10
+        idx = np.array([k for k in range(15) if k != 1])
+        for numbering, p_expected in (('blocks', list(range(14))), ('flat', list(idx))):
+            with self.subTest(numbering):
+                P = pb.write_grid_points(self.dir, disp, lats, lons, T, numbering=numbering,
+                                         attributes={'coherence': coherence, 'height': height})
+                manifest, p, lon, lat, m, d, attrs = pb.read_points(self.dir)
+                self.assertEqual((P, list(p)), (14, p_expected))
+                self.assertEqual(manifest['attributes'], ['coherence', 'height'])          # in the order given
+                self.assertEqual(manifest['attribute_types'],
+                                 {'coherence': 'double precision', 'height': 'double precision'})
+                self.assertEqual(pb.read_manifest(self.dir), manifest)
+                np.testing.assert_array_equal(attrs['coherence'],
+                                              coherence.reshape(-1)[idx].astype(np.float64))   # NaN at (1, 3)
+                self.assertTrue(np.isnan(attrs['coherence'][list(idx).index(8)]))
+                np.testing.assert_array_equal(attrs['height'], height.reshape(-1)[idx])
+
+    def test_a_grid_attribute_without_a_value_at_any_point_is_left_out(self):
+        disp = grid()
+        disp[:, 0, 1] = np.nan
+        lats, lons = np.meshgrid(np.linspace(-0.8, -0.9, 3), np.linspace(-91.1, -91.2, 5), indexing='ij')
+        decomposition = np.full((3, 5), np.nan, dtype=np.float32)       # a horizontal or vertical decomposition's
+        only_masked = np.full((3, 5), np.nan, dtype=np.float32)
+        only_masked[0, 1] = 0.3                                         # a value only where no point is
+        pb.write_grid_points(self.dir, disp, lats, lons, T, attributes={'a': decomposition, 'b': only_masked,
+                                                                        'c': np.ones((3, 5))})
+        manifest, p, lon, lat, m, d, attrs = pb.read_points(self.dir)
+        self.assertEqual(manifest['attributes'], ['c'])
+        self.assertEqual(sorted(n for n in os.listdir(self.dir) if n.startswith('attr_')), ['attr_c.npy'])
+        with self.assertRaisesRegex(pb.PointsError, 'attribute a is'):
+            pb.write_grid_points(self.dir, disp, lats, lons, T, attributes={'a': np.ones((5, 3))})
 
     def test_points_with_attributes_round_trip(self):
         point_id = np.array([7.0, np.nan, 9.0])
