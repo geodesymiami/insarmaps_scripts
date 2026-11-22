@@ -191,9 +191,10 @@ def upload_points(folder_path, store_root=rsi.DEFAULT_ROOT, store_tools=rsi.DEFA
     timing = {}
     if not points_bundle.has_points(folder_path):
         if rsi.json_chunk_files(folder_path):
-            fail("%s holds the JSON chunk files of an older step 1, which the upload doesn't read any more. Update "
-                 "insarmaps_scripts on the machine that ran step 1 (git pull in $MINSAR_HOME/tools/insarmaps_scripts) "
-                 "and run step 1 again" % folder_path)
+            fail("%s holds the JSON chunk files of an older step 1, which the upload doesn't read any more. On the "
+                 "machine that ran step 1, update both minsar and insarmaps_scripts (git pull in $MINSAR_HOME and in "
+                 "$MINSAR_HOME/tools/insarmaps_scripts; a minsar from before 2026-11-21 still expects an .mbtiles "
+                 "file), then run step 1 again" % folder_path)
         fail("no points in %s (points.json): run step 1 first" % folder_path)
     metadata = read_metadata(folder_path)
     area_name = metadata["area"]
