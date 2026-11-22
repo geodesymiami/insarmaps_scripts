@@ -245,7 +245,8 @@ class Upload(unittest.TestCase):
         code, out, err = self.upload()
         self.assertEqual(code, 1)
         self.assertIn('JSON chunk files of an older step 1', err)
-        self.assertIn('git pull', err)
+        # both checkouts: a minsar from before 2026-11-21 with new scripts uploads, then fails copying an .mbtiles
+        self.assertIn('git pull in $MINSAR_HOME and in $MINSAR_HOME/tools/insarmaps_scripts', err)
         j.InsarDatabaseController.assert_not_called()
 
     def test_no_points_fails_before_the_database(self):

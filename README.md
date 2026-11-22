@@ -36,8 +36,9 @@ stay, since minsar calls the scripts by them; `--num-workers` is accepted and no
 
 `json_mbtiles2insarmaps.py --json_folder DIR -u DBUSER -p DBPASS --host HOST` uploads the dataset that
 `hdfeos5_2json_mbtiles.py` or `hdfeos5_or_csv_2json_mbtiles.py` wrote to DIR (`metadata.pickle` and the points). It
-refuses a DIR that holds only the `chunk_*.json` of an older step 1: update insarmaps_scripts where step 1 ran, and run
-it again.
+refuses a DIR that holds only the `chunk_*.json` of an older step 1: update both minsar and insarmaps_scripts where
+step 1 ran (a minsar from before 2026-11-21 still expects an .mbtiles file, and fails after the upload), and run it
+again.
 It runs on the insarmaps server itself, where the database is (minsar's `ingest_insarmaps.bash` step 2 does this over
 ssh, with `--host 127.0.0.1`), and connects to port 5432 unless `PGPORT` names another.
 
