@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """A dataset's points as arrays: what step 1 hands to step 2, in place of JSON chunk files.
 
-Step 1 (hdfeos5_2json_mbtiles.py, hdfeos5_or_csv_2json_mbtiles.py) writes the folder. Step 2
-(json_mbtiles2insarmaps.py) loads the point table from it with binary COPY, and the insarmaps tool
-tools/recolor_store/convert_from_points.py builds the dataset's recolor store from it. Beside metadata.pickle:
+Step 1 (insarmaps_ingester.py) writes the folder. Step 2 (json_mbtiles2insarmaps.py) loads the point table from it
+with binary COPY, and the insarmaps tool tools/recolor_store/convert_from_points.py builds the dataset's recolor store
+from it. Beside metadata.pickle:
 
     points.json       {"format": "insarmaps-points", "version": 1, "points": P, "dates": N,
                        "d_dtype": "float32" or "float64", "attributes": [NAME, ...],
@@ -65,9 +65,10 @@ def fit_velocities(t, d):
 def grid_points(disp, block=BLOCK, numbering="blocks"):
     """The cells of a grid (disp: N dates x rows x cols, NaN where masked or missing) that become points: their flat
     indices (row * cols + col, increasing) and their p. A cell is a point when it has values at two dates or more.
-    numbering "blocks" (hdfeos5_2json_mbtiles.py): p counts the points from the first cell of each block of `block`
-    cells; "flat" (hdfeos5_or_csv_2json_mbtiles.py): p is the flat index. Either way it is the number that script's
-    JSON gave the point, for every dataset without gaps."""
+    numbering "blocks" (an HDF-EOS5 file, as hdfeos5_2json_mbtiles.py numbered it): p counts the points from the first
+    cell of each block of `block` cells; "flat" (insarmaps_ingester.py --he5-like-csv, as
+    hdfeos5_or_csv_2json_mbtiles.py numbered an HDF-EOS5 file): p is the flat index. Either way it is the number that
+    script's JSON gave the point, for every dataset without gaps."""
     n_dates = disp.shape[0]
     values = np.zeros(disp.shape[1] * disp.shape[2], dtype=np.int32)
     flat = disp.reshape(n_dates, -1)

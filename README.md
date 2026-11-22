@@ -14,19 +14,26 @@ The below install instructions have been tested on ubuntu 22.04. Installing on W
 3. Run `conda install -file environment.yml` to install non-python code (gdal, libpq)
 4. Run `pip install -r requirements.txt` to install remaining requirements
 
-## Converting a dataset: hdfeos5_2json_mbtiles.py, hdfeos5_or_csv_2json_mbtiles.py
+## Converting a dataset: insarmaps_ingester.py
 
-`hdfeos5_2json_mbtiles.py FILE.he5 DIR` and `hdfeos5_or_csv_2json_mbtiles.py FILE.he5|FILE.csv DIR` write the dataset to
-DIR as its points, numpy arrays (`points_bundle.py`: `points.json`, `p.npy`, `lon.npy`, `lat.npy`, `m.npy`, `d.npy`,
-and `attr_NAME.npy` for a CSV's quality columns; insarmaps `docs/recolor-store.md` section 12), and `metadata.pickle`.
-They read the input once and write no JSON and no `.mbtiles`; files of an earlier run in DIR are replaced. (The names
-stay, since minsar calls the scripts by them; `--num-workers` is accepted and not needed.)
+`insarmaps_ingester.py FILE DIR` writes the dataset in FILE, a CSV when its name ends in `.csv` and an HDF-EOS5 file
+(`.he5`) otherwise, to DIR as its points, numpy arrays (`points_bundle.py`: `points.json`, `p.npy`, `lon.npy`,
+`lat.npy`, `m.npy`, `d.npy`, and `attr_NAME.npy` for a CSV's quality columns; insarmaps `docs/recolor-store.md`
+section 12), and `metadata.pickle`. It reads the input once and writes no JSON and no `.mbtiles`; files of an earlier
+run in DIR are replaced. `--num-workers` is accepted and not needed.
 
-- A grid cell (`.he5`) or CSV row becomes a point when it has values at two dates or more; a missing value is NaN in
-  `d`, and the point's velocity `m` is the least-squares slope over the dates it has.
-- `p`: `hdfeos5_2json_mbtiles.py` counts the points from the first cell of each block of 20,000 cells;
-  `hdfeos5_or_csv_2json_mbtiles.py` uses the cell's flat index or the CSV row (0 for the first data row), as their JSON
-  did.
+It replaces `hdfeos5_2json_mbtiles.py`, which minsar ran for an HDF-EOS5 file, and `hdfeos5_or_csv_2json_mbtiles.py`,
+which it ran for a CSV, and writes the same points and metadata for each. A minsar that still calls those names stops
+at step 1 with "command not found": update minsar too. With `--he5-like-csv`, an HDF-EOS5 file gets what
+`hdfeos5_or_csv_2json_mbtiles.py` wrote for one, as for a CSV: `p` is the cell's flat index (row * WIDTH + col), the
+dataset's position the mean of its cells', and the attributes a CSV's (`dem` among them, WIDTH and LENGTH only with a
+geographic grid). minsar doesn't use it.
+
+- A grid cell (HDF-EOS5) or CSV row becomes a point when it has values at two dates or more; a missing value is NaN
+  in `d`, and the point's velocity `m` is the least-squares slope over the dates it has.
+- `p`: an HDF-EOS5 file's points are counted from the first cell of each block of 20,000 cells (with
+  `--he5-like-csv`, `p` is the flat index); a CSV's `p` is the row (0 for the first data row). These are the numbers
+  step 1's JSON gave the points.
 - `d` holds the input's values exactly: float32 from an HDF-EOS5 file, float64 from a CSV (mm converted to m).
 - A CSV's quality columns keep their order; `point_ID` is an integer column when its values are whole numbers that fit
   int32; a missing quality value is NaN, and NULL in the point table.
@@ -35,10 +42,9 @@ stay, since minsar calls the scripts by them; `--num-workers` is accepted and no
 ## Uploading a dataset: json_mbtiles2insarmaps.py
 
 `json_mbtiles2insarmaps.py --json_folder DIR -u DBUSER -p DBPASS --host HOST` uploads the dataset that
-`hdfeos5_2json_mbtiles.py` or `hdfeos5_or_csv_2json_mbtiles.py` wrote to DIR (`metadata.pickle` and the points). It
-refuses a DIR that holds only the `chunk_*.json` of an older step 1: update both minsar and insarmaps_scripts where
-step 1 ran (a minsar from before 2026-11-21 still expects an .mbtiles file, and fails after the upload), and run it
-again.
+`insarmaps_ingester.py` wrote to DIR (`metadata.pickle` and the points). It refuses a DIR that holds only the
+`chunk_*.json` of an older step 1: update both minsar and insarmaps_scripts where step 1 ran (a minsar from before
+2026-11-21 still expects an .mbtiles file, and fails after the upload), and run it again.
 It runs on the insarmaps server itself, where the database is (minsar's `ingest_insarmaps.bash` step 2 does this over
 ssh, with `--host 127.0.0.1`), and connects to port 5432 unless `PGPORT` names another.
 
