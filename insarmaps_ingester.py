@@ -4,26 +4,31 @@
 # Copyright (c) 2013, Zhang Yunjun, Heresh Fattahi         #
 # Author: Alfredo Terrero, 2016                            #
 ############################################################
+"""Step 1 of an Insarmaps ingest: an HDF-EOS5 file (.he5) or a CSV to the dataset's points, as arrays
+(points_bundle.py), and metadata.pickle. Step 2, json_mbtiles2insarmaps.py, loads them into the database and builds
+the dataset's recolor store, from which the map draws it.
 
-
+This script replaces hdfeos5_2json_mbtiles.py, which minsar ran for an HDF-EOS5 file, and
+hdfeos5_or_csv_2json_mbtiles.py, which it ran for a CSV. Each input gets what its script wrote. The CSV script also
+took an .he5 and wrote other point numbers and metadata for it; --he5-like-csv writes that (minsar doesn't use it, and
+no dataset on insarmaps came from it).
+"""
+import argparse
 import os
+import pickle
 import re
 import sys
-import argparse
-import pickle
 import time
 from datetime import date
 from datetime import datetime
-import geocoder
-import numpy as np
 from pathlib import Path
 
-from mintpy.objects import HDFEOS
-from mintpy.mask import mask_matrix
-from mintpy.utils import utils as ut
+import geocoder
 import h5py
-
+import numpy as np
 import pandas as pd
+from mintpy.mask import mask_matrix
+from mintpy.objects import HDFEOS
 
 import points_bundle
 
@@ -31,6 +36,22 @@ import points_bundle
 # Matching is case-insensitive (EGMS uses latitude/longitude).
 LAT_CANDIDATES = ["Y_geocorr", "Latitude", "latitude", "Y", "ycoord"]
 LON_CANDIDATES = ["X_geocorr", "Longitude", "longitude", "X", "xcoord"]
+
+# The attributes that go into the dataset's area row (attribute_keys/attribute_values) and its extra_attributes
+NEEDED_ATTRIBUTES = frozenset({
+    "prf", "first_date", "mission", "WIDTH", "X_STEP", "processing_software",
+    "wavelength", "processing_type", "beam_swath", "Y_FIRST", "look_direction",
+    "flight_direction", "last_frame", "post_processing_method", "min_baseline_perp",
+    "unwrap_method", "relative_orbit", "beam_mode", "LENGTH", "max_baseline_perp",
+    "X_FIRST", "atmos_correct_method", "last_date", "first_frame", "frame", "Y_STEP", "history",
+    "scene_footprint", "data_footprint", "downloadUnavcoUrl", "referencePdfUrl", "areaName", "referenceText",
+    "REF_LAT", "REF_LON", "CENTER_LINE_UTC", "insarmaps_download_flag", "mintpy.subset.lalo",
+})
+# hdfeos5_2json_mbtiles.py's list lacked a comma between these two, which made them one name that no attribute has,
+# so no HDF-EOS5 dataset got them (MintPy files carry unwrap_method = Unknown). An .he5 still leaves them out.
+NOT_FROM_HDFEOS5 = frozenset({"min_baseline_perp", "unwrap_method"})
+GRID_ATTRIBUTES = ("X_STEP", "Y_STEP", "X_FIRST", "Y_FIRST")
+
 
 # ---------------------------------------------------------------------------------------
 # FUNCTIONS
@@ -43,6 +64,7 @@ def get_date(date_string):
 
 
 def get_decimal_date(d):
+    """year + days elapsed in the year / 365: the date as the velocity fit's time"""
     start = date(d.year, 1, 1)
     return abs(d - start).days / 365.0 + d.year
 
@@ -52,23 +74,141 @@ def region_name_from_project_name(project_name):
     return project_name[:track_index]
 
 
-needed_attributes = {
-    "prf", "first_date", "mission", "WIDTH", "X_STEP", "processing_software",
-    "wavelength", "processing_type", "beam_swath", "Y_FIRST", "look_direction",
-    "flight_direction", "last_frame", "post_processing_method", "min_baseline_perp",
-    "unwrap_method", "relative_orbit", "beam_mode", "LENGTH", "max_baseline_perp",
-    "X_FIRST", "atmos_correct_method", "last_date", "first_frame", "frame", "Y_STEP", "history",
-    "scene_footprint", "data_footprint", "downloadUnavcoUrl", "referencePdfUrl", "areaName", "referenceText",
-    "REF_LAT", "REF_LON", "CENTER_LINE_UTC", "insarmaps_download_flag", "mintpy.subset.lalo",
-}
+def dataset_name(file_name):
+    """The dataset's name (the area's unavco_name): the file name up to its first dot."""
+    return os.path.basename(file_name).split(".")[0]
 
 
-def serialize_dictionary(dictionary, fileName):
-    """Serialize a dictionary to a pickle file."""
-    with open(fileName, "wb") as file:
-        pickle.dump(dictionary, file, protocol=pickle.HIGHEST_PROTOCOL)
+def high_res_mode(attributes):
+    """True when geographic X_STEP/Y_STEP are absent (radar-coded or point CSV)."""
+    return "X_STEP" not in attributes or "Y_STEP" not in attributes
 
 
+def write_metadata(json_path, area, attributes, dates, decimal_dates, mid_lat, mid_long, needed, country_default,
+                   extra_keys=()):
+    """Write metadata.pickle, from which json_mbtiles2insarmaps.py makes the dataset's area row and adds the
+    attributes named in needed to extra_attributes. attribute_keys/attribute_values: the attributes named in needed, in
+    the order of attributes, then extra_keys ((key, value) pairs). country is country_default when the lookup fails."""
+    project_name = attributes["PROJECT_NAME"]
+
+    country = country_default
+    try:
+        g = geocoder.google([mid_lat, mid_long], method="reverse", timeout=60.0)
+        country = str(g.country_long)
+    except Exception:
+        sys.stderr.write("timeout reverse geocoding country name")
+
+    attribute_keys = []
+    attribute_values = []
+    max_digit = max([len(key) for key in needed] + [0])
+    for k, v in attributes.items():
+        if k in needed:
+            print(f"{k:<{max_digit}}     {v}")
+            attribute_keys.append(k)
+            attribute_values.append(v)
+    for k, v in extra_keys:
+        attribute_keys.append(k)
+        attribute_values.append(v)
+
+    insarmapsMetadata = {
+        "area": area,
+        "project_name": project_name,
+        "mid_long": mid_long,
+        "mid_lat": mid_lat,
+        "country": country,
+        "region": region_name_from_project_name(project_name),
+        "chunk_num": 1,
+        "attribute_keys": attribute_keys,
+        "attribute_values": attribute_values,
+        # for some reason pgsql only takes {} not []
+        "string_dates_sql": "{" + ",".join(str(k) for k in dates) + "}",
+        "decimal_dates_sql": "{" + ",".join(str(d) for d in decimal_dates) + "}",
+        "attributes": attributes,
+        "needed_attributes": needed,
+    }
+    with open(os.path.join(json_path, "metadata.pickle"), "wb") as file:
+        pickle.dump(insarmapsMetadata, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def write_metadata_like_csv(json_path, area, attributes, dates, decimal_dates, lats, lons):
+    """metadata.pickle as hdfeos5_or_csv_2json_mbtiles.py wrote it, for a CSV and for an HDF-EOS5 file with
+    --he5-like-csv: the needed attributes, less WIDTH, LENGTH and the grid's when there is no geographic grid
+    (high_res_mode, always so for a CSV); the mean position of all the rows or cells (lats, lons); "dem" last, which
+    makes 'elevation' show up in the popup; "None" when the country lookup fails."""
+    needed = set(NEEDED_ATTRIBUTES)
+    if high_res_mode(attributes):
+        needed.difference_update(GRID_ATTRIBUTES + ("WIDTH", "LENGTH"))
+    write_metadata(json_path, area, attributes, dates, decimal_dates, float(np.nanmean(lats)),
+                   float(np.nanmean(lons)), needed, country_default="None", extra_keys=[("dem", "1")])
+
+
+# ---------------------------------------------------------------------------------------
+# HDF-EOS5 (.he5)
+# ---------------------------------------------------------------------------------------
+def read_from_hdfeos5_file(file_name):
+    """Read HDFEOS5: the attributes, the dates, the masked displacement (dates x rows x cols, NaN where masked) and the
+    2D lat/lon grids."""
+    he_obj = HDFEOS(file_name)
+    he_obj.open(print_msg=False)
+    displacement = he_obj.read(datasetName="displacement")
+    mask = he_obj.read(datasetName="mask")
+    print("Masking displacement")
+    displacement = mask_matrix(displacement, mask)
+    del mask
+
+    # MintPy doesn't read the lat/lon grids, so they come from the raw h5 file
+    with h5py.File(he_obj.file, "r") as f:
+        lats = np.array(f["HDFEOS"]["GRIDS"]["timeseries"]["geometry"]["latitude"])
+        lons = np.array(f["HDFEOS"]["GRIDS"]["timeseries"]["geometry"]["longitude"])
+    return dict(he_obj.metadata), he_obj.dateList, displacement, lats, lons
+
+
+def convert_hdfeos5(file_name, output_folder, like_csv=False):
+    """Writes an HDF-EOS5 file's points and metadata.pickle as hdfeos5_2json_mbtiles.py did or, with like_csv, as
+    hdfeos5_or_csv_2json_mbtiles.py did: each cell numbered by its flat index, and the metadata a CSV gets."""
+    attributes, dates, displacement, lats, lons = read_from_hdfeos5_file(file_name)
+    decimal_dates = [get_decimal_date(get_date(d)) for d in dates]
+
+    # every cell with values at two dates or more, its velocity fitted over the dates it has, numbered from the first
+    # cell of each block of 20,000 cells or, like_csv, by its flat index (row * WIDTH + col)
+    num_points = points_bundle.write_grid_points(output_folder, displacement, lats, lons, decimal_dates,
+                                                 numbering="flat" if like_csv else "blocks")
+    print("points: %d of %d cells, %d dates" % (num_points, lats.size, len(dates)))
+    del displacement
+
+    if like_csv:
+        attributes["collection"] = "hdfeos5"
+        write_metadata_like_csv(output_folder, dataset_name(file_name), attributes, dates, decimal_dates,
+                                lats.reshape(-1), lons.reshape(-1))
+        return
+
+    num_columns = int(attributes["WIDTH"])
+    num_rows = int(attributes["LENGTH"])
+    print("columns: %d" % num_columns)
+    print("rows: %d" % num_rows)
+    needed = set(NEEDED_ATTRIBUTES - NOT_FROM_HDFEOS5)
+    if high_res_mode(attributes):
+        # radar-coded: no regular geographic grid; the middle cell's position
+        needed.difference_update(GRID_ATTRIBUTES)
+        num_rows, num_columns = lats.shape
+        mid_long = float(lons[num_rows // 2][num_columns // 2])
+        mid_lat = float(lats[num_rows // 2][num_columns // 2])
+    else:
+        # geocoded: the middle of the grid
+        x_step = float(attributes["X_STEP"])
+        y_step = float(attributes["Y_STEP"])
+        x_first = float(attributes["X_FIRST"])
+        y_first = float(attributes["Y_FIRST"])
+        mid_long = x_first + ((num_columns / 2) * x_step)
+        mid_lat = y_first + ((num_rows / 2) * y_step)
+
+    write_metadata(output_folder, dataset_name(file_name), attributes, dates, decimal_dates, mid_lat, mid_long,
+                   needed, country_default=None)
+
+
+# ---------------------------------------------------------------------------------------
+# CSV
+# ---------------------------------------------------------------------------------------
 def integer_or_double(values):
     """The point table's type for a column of numbers held as floats (NaN where missing): integer when every value
     there is a whole number that fits int32, as ogr2ogr typed the JSON this script used to write, else double
@@ -102,113 +242,6 @@ def write_csv_points(json_path, timeseries_data, lats, lons, decimal_dates, qual
         del attributes["point_ID"]
     types = {"point_ID": integer_or_double(attributes["point_ID"])} if "point_ID" in attributes else {}
     return points_bundle.write_points(json_path, rows, lon, lat, m, d, attributes, types)
-
-
-def write_metadata(attributes, decimal_dates, dates, json_path, folder_name, lats=None, lons=None):
-    """Write metadata.pickle, from which json_mbtiles2insarmaps.py makes the dataset's area row."""
-    project_name = attributes["PROJECT_NAME"]
-    region = region_name_from_project_name(project_name)
-
-    # Per-run copy so removals do not mutate the module-level set
-    attrs_needed = set(needed_attributes)
-
-    if high_res_mode(attributes):
-        # No regular geographic step (radar-coded / CSV point cloud)
-        for key in ("X_STEP", "Y_STEP", "X_FIRST", "Y_FIRST", "WIDTH", "LENGTH"):
-            attrs_needed.discard(key)
-
-    if lats is None and lons is None:
-        lats, lons = ut.get_lat_lon(attributes, dimension=1)
-
-    insarmapsMetadata = {}
-    mid_lat = float(np.nanmean(lats))
-    mid_long = float(np.nanmean(lons))
-
-    country = "None"
-    try:
-        g = geocoder.google([mid_lat, mid_long], method="reverse", timeout=60.0)
-        country = str(g.country_long)
-    except Exception:
-        sys.stderr.write("timeout reverse geocoding country name")
-
-    area = folder_name
-    string_dates_sql = "{" + ",".join(str(k) for k in dates) + "}"
-    decimal_dates_sql = "{" + ",".join(str(d) for d in decimal_dates) + "}"
-
-    attribute_keys = []
-    attribute_values = []
-    max_digit = max([len(key) for key in list(attrs_needed)] + [0])
-
-    for k, v in attributes.items():
-        if k in attrs_needed:
-            print(f"{k:<{max_digit}}     {v}")
-            attribute_keys.append(k)
-            attribute_values.append(v)
-
-    # Force 'elevation' to show up in popup
-    attribute_keys.append("dem")
-    attribute_values.append("1")
-
-    insarmapsMetadata["area"] = area
-    insarmapsMetadata["project_name"] = project_name
-    insarmapsMetadata["mid_long"] = mid_long
-    insarmapsMetadata["mid_lat"] = mid_lat
-    insarmapsMetadata["country"] = country
-    insarmapsMetadata["region"] = region
-    insarmapsMetadata["chunk_num"] = 1
-    insarmapsMetadata["attribute_keys"] = attribute_keys
-    insarmapsMetadata["attribute_values"] = attribute_values
-    insarmapsMetadata["string_dates_sql"] = string_dates_sql
-    insarmapsMetadata["decimal_dates_sql"] = decimal_dates_sql
-    insarmapsMetadata["attributes"] = attributes
-    insarmapsMetadata["needed_attributes"] = attrs_needed
-
-    metadataFilePath = json_path + "/metadata.pickle"
-    serialize_dictionary(insarmapsMetadata, metadataFilePath)
-
-
-def high_res_mode(attributes):
-    """True when geographic X_STEP/Y_STEP are absent (radar-coded or point CSV)."""
-    try:
-        _x_step = attributes["X_STEP"]
-        _y_step = attributes["Y_STEP"]
-    except Exception:
-        return True
-    return False
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """Build the command-line argument parser for hdfeos5_or_csv_2json_mbtiles.py."""
-    example_text = """\
-This program writes the dataset's points as arrays (points.json, p.npy, lon.npy,
-lat.npy, m.npy, d.npy and attr_NAME.npy for a CSV's quality columns) and
-metadata.pickle. json_mbtiles2insarmaps.py uploads them and builds the dataset's
-recolor store, from which the map draws it.
-
-Examples:
-  hdfeos5_or_csv_2json_mbtiles.py mintpy/S1_IW1_128_0596_0597_20160605_XXXXXXXX_S00887_S00783_W091208_W091105.he5 mintpy/JSON
-  hdfeos5_or_csv_2json_mbtiles.py sarvey_test.csv ./JSON
-  hdfeos5_or_csv_2json_mbtiles.py NOAA_SNT_A_VERT_10_50m.csv ./JSON_NOAA
-    """
-
-    parser = argparse.ArgumentParser(
-        description="Convert an HDFEOS5 (.he5) or CSV file for ingestion into Insarmaps.",
-        epilog=example_text,
-        formatter_class=argparse.RawTextHelpFormatter,
-    )
-
-    parser.add_argument(
-        "--num-workers",
-        help="Not needed any more: the conversion runs in one process. Accepted for the callers that still pass it.",
-        required=False,
-        default=1,
-        type=int,
-    )
-
-    required = parser.add_argument_group("required arguments")
-    required.add_argument("file", help="(unavco) Input file to ingest (.he5 or .csv).")
-    required.add_argument("outputDir", help="Directory to place the points files and metadata.pickle.")
-    return parser
 
 
 def add_dummy_attribute(attributes: dict, is_sarvey_format: bool) -> None:
@@ -266,37 +299,6 @@ def add_data_footprint_attribute(attributes: dict, lats: np.ndarray, lons: np.nd
     print("data_footprint: ", polygon)
     attributes["data_footprint"] = polygon
     attributes["scene_footprint"] = polygon
-
-
-def read_from_hdfeos5_file(file_name):
-    """Read HDFEOS5: the masked displacement (dates x rows x cols, NaN where masked) and the 2D lat/lon grids."""
-    should_mask = True
-
-    path_name_and_extension = os.path.basename(file_name).split(".")
-    path_name = path_name_and_extension[0]
-
-    he_obj = HDFEOS(file_name)
-    he_obj.open(print_msg=False)
-    displacement_3d_matrix = he_obj.read(datasetName="displacement")
-    mask = he_obj.read(datasetName="mask")
-    if should_mask:
-        print("Masking displacement")
-        displacement_3d_matrix = mask_matrix(displacement_3d_matrix, mask)
-    del mask
-
-    dates = he_obj.dateList
-    attributes = dict(he_obj.metadata)
-    decimal_dates = [get_decimal_date(get_date(d)) for d in dates]
-
-    path_list = path_name.split("/")
-    folder_name = path_name.split("/")[len(path_list) - 1]
-
-    with h5py.File(he_obj.file, "r") as f:
-        lats = np.array(f["HDFEOS"]["GRIDS"]["timeseries"]["geometry"]["latitude"])
-        lons = np.array(f["HDFEOS"]["GRIDS"]["timeseries"]["geometry"]["longitude"])
-
-    attributes["collection"] = "hdfeos5"
-    return attributes, decimal_dates, displacement_3d_matrix, dates, folder_name, lats, lons
 
 
 def add_calculated_attributes(attributes: dict) -> None:
@@ -457,7 +459,7 @@ def read_from_csv_file(file_name):
     elif "pid" in df.columns:
         quality_params["point_ID"] = pd.to_numeric(df["pid"], errors="coerce").to_numpy(dtype=float)
 
-    folder_name = os.path.basename(file_name).split(".")[0]
+    folder_name = dataset_name(file_name)
 
     print(" Check: read_from_csv_file output")
     print(" - dates:", dates[:3], "...")
@@ -479,49 +481,87 @@ def read_from_csv_file(file_name):
     )
 
 
+def convert_csv(file_name, output_folder):
+    (
+        attributes,
+        decimal_dates,
+        timeseries_data,
+        dates,
+        folder_name,
+        lats,
+        lons,
+        quality_params,
+    ) = read_from_csv_file(file_name)
+    num_points = write_csv_points(output_folder, timeseries_data, lats, lons, decimal_dates, quality_params)
+    print("points: %d of %d rows, %d dates" % (num_points, lats.size, len(dates)))
+    write_metadata_like_csv(output_folder, folder_name, attributes, dates, decimal_dates, lats, lons)
+
+
+# ---------------------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser for insarmaps_ingester.py."""
+    example_text = """\
+This program writes the dataset's points as arrays (points.json, p.npy, lon.npy,
+lat.npy, m.npy, d.npy and attr_NAME.npy for a CSV's quality columns) and
+metadata.pickle. json_mbtiles2insarmaps.py uploads them and builds the dataset's
+recolor store, from which the map draws it. A file whose name ends in .csv is read
+as a CSV, any other as HDF-EOS5.
+
+Examples:
+  insarmaps_ingester.py mintpy/S1_IW1_128_0596_0597_20160605_XXXXXXXX_S00887_S00783_W091208_W091105.he5 mintpy/JSON
+  insarmaps_ingester.py --he5-like-csv mintpy/S1_IW1_128_0596_0597_20160605_XXXXXXXX.he5 mintpy/JSON
+  insarmaps_ingester.py sarvey_test.csv ./JSON
+  insarmaps_ingester.py NOAA_SNT_A_VERT_10_50m.csv ./JSON_NOAA
+    """
+
+    parser = argparse.ArgumentParser(
+        description="Convert an HDFEOS5 (.he5) or CSV file for ingestion into Insarmaps.",
+        epilog=example_text,
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    parser.add_argument(
+        "--num-workers",
+        help="Not needed any more: the conversion runs in one process. Accepted for the callers that still pass it.",
+        required=False,
+        default=1,
+        type=int,
+    )
+    parser.add_argument(
+        "--he5-like-csv",
+        action="store_true",
+        help="For an HDF-EOS5 file, write what hdfeos5_or_csv_2json_mbtiles.py wrote for one, as for a CSV:\n"
+             "p is the cell's flat index (row * WIDTH + col), the dataset's position the mean of its cells',\n"
+             "and the area's attributes a CSV's (all needed ones, WIDTH and LENGTH only with a geographic grid,\n"
+             "and dem). Without it, an HDF-EOS5 file gets what hdfeos5_2json_mbtiles.py wrote, as minsar\n"
+             "uses. No effect on a CSV.",
+    )
+
+    required = parser.add_argument_group("required arguments")
+    required.add_argument("file", help="(unavco) Input file to ingest (.he5 or .csv).")
+    required.add_argument("outputDir", help="Directory to place the points files and metadata.pickle.")
+    return parser
+
+
+# ---------------------------------------------------------------------------------------
+# START OF EXECUTABLE
+# ---------------------------------------------------------------------------------------
 def main():
-    """Entry point for hdfeos5_or_csv_2json_mbtiles.py."""
-    parser = build_parser()
-    args = parser.parse_args()
-    file_name = args.file
-    output_folder = args.outputDir
-
-    try:
-        os.mkdir(output_folder)
-    except FileExistsError:
-        print(output_folder + " already exists")
-
-    file_path = Path(file_name)
+    """Entry point for insarmaps_ingester.py."""
+    args = build_parser().parse_args()
     start_time = time.perf_counter()
 
-    suffix = file_path.suffix.lower()
-    if suffix == ".he5":
-        attributes, decimal_dates, displacement, dates, folder_name, lats, lons = read_from_hdfeos5_file(file_name)
-        # every cell with values at two dates or more, p = its flat index (row * WIDTH + col)
-        num_points = points_bundle.write_grid_points(output_folder, displacement, lats, lons, decimal_dates,
-                                                     numbering="flat")
-        del displacement
-        lats, lons = lats.reshape(-1), lons.reshape(-1)
-    elif suffix == ".csv":
-        (
-            attributes,
-            decimal_dates,
-            timeseries_data,
-            dates,
-            folder_name,
-            lats,
-            lons,
-            quality_params,
-        ) = read_from_csv_file(file_name)
-        num_points = write_csv_points(output_folder, timeseries_data, lats, lons, decimal_dates, quality_params)
+    if os.path.isdir(args.outputDir):
+        print(args.outputDir + " already exists")
+    os.makedirs(args.outputDir, exist_ok=True)
+
+    # as minsar's ingest_insarmaps.bash decides: a .csv is a CSV, any other file HDF-EOS5
+    if Path(args.file).suffix.lower() == ".csv":
+        convert_csv(args.file, args.outputDir)
     else:
-        raise ValueError(f"The file '{file_path}' must have .he5 or .csv as extension.")
-    print(f"[INFO] points: {num_points} of {lats.size}, {len(dates)} dates")
+        convert_hdfeos5(args.file, args.outputDir, like_csv=args.he5_like_csv)
 
-    write_metadata(attributes, decimal_dates, dates, output_folder, folder_name, lats, lons)
-
-    end_time = time.perf_counter()
-    print("time elapsed: " + str(end_time - start_time))
+    print("time elapsed: " + str(time.perf_counter() - start_time))
 
 
 if __name__ == "__main__":

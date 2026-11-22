@@ -340,8 +340,8 @@ def non_negative(text):
 def build_parser():
     dbHost = "insarmaps.rsmas.miami.edu"
     parser = argparse.ArgumentParser(description='Upload a dataset (the metadata.pickle and points that '
-        'hdfeos5_2json_mbtiles.py or hdfeos5_or_csv_2json_mbtiles.py wrote) into the insarmaps database and build '
-        'its recolor store, from which the map draws it; or remove or list datasets.')
+        'insarmaps_ingester.py wrote) into the insarmaps database and build its recolor store, from which the map '
+        'draws it; or remove or list datasets.')
     parser.add_argument("--num-workers", help="Not needed any more: the points load in one stream. Accepted for the "
         "callers that still pass it.", required=False, default=1, type=int)
     parser.add_argument("--json_folder", help="the folder step 1 wrote (metadata.pickle, points.json and its .npy "
