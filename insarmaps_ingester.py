@@ -163,18 +163,45 @@ def read_from_hdfeos5_file(file_name):
     return dict(he_obj.metadata), he_obj.dateList, displacement, lats, lons
 
 
+def read_temporal_coherence(file_name, shape):
+    """The file's temporal coherence (HDFEOS/GRIDS/timeseries/quality/temporalCoherence), one value per cell of the
+    grid (shape: rows, cols), as the file holds it; None when the file has no such layer, or one of another shape. The
+    file's mask, applied to the displacement, is mostly a temporal coherence threshold of its own (MintPy's
+    minTempCoh), so the points' coherence starts there."""
+    with h5py.File(file_name, "r") as f:
+        layer = f.get("HDFEOS/GRIDS/timeseries/quality/temporalCoherence")
+        if not isinstance(layer, h5py.Dataset):
+            return None
+        if layer.shape != tuple(shape):
+            print("temporalCoherence is %s, not the grid's %s: left out" % (layer.shape, tuple(shape)))
+            return None
+        return layer[()]
+
+
 def convert_hdfeos5(file_name, output_folder, like_csv=False):
     """Writes an HDF-EOS5 file's points and metadata.pickle as hdfeos5_2json_mbtiles.py did or, with like_csv, as
-    hdfeos5_or_csv_2json_mbtiles.py did: each cell numbered by its flat index, and the metadata a CSV gets."""
+    hdfeos5_or_csv_2json_mbtiles.py did: each cell numbered by its flat index, and the metadata a CSV gets. Either
+    way the points get the file's temporal coherence as their attribute coherence, when the file has one."""
     attributes, dates, displacement, lats, lons = read_from_hdfeos5_file(file_name)
+    coherence = read_temporal_coherence(file_name, displacement.shape[1:])
     decimal_dates = [get_decimal_date(get_date(d)) for d in dates]
 
     # every cell with values at two dates or more, its velocity fitted over the dates it has, numbered from the first
-    # cell of each block of 20,000 cells or, like_csv, by its flat index (row * WIDTH + col)
+    # cell of each block of 20,000 cells or, like_csv, by its flat index (row * WIDTH + col). Its temporal coherence
+    # becomes its attribute coherence, the name a CSV's coherence column gets, which the map's Min Coherence slider
+    # reads from the dataset's recolor store; left out when no point has a value (a horizontal or vertical
+    # decomposition's layer is all NaN)
     num_points = points_bundle.write_grid_points(output_folder, displacement, lats, lons, decimal_dates,
-                                                 numbering="flat" if like_csv else "blocks")
+                                                 numbering="flat" if like_csv else "blocks",
+                                                 attributes=None if coherence is None else {"coherence": coherence})
     print("points: %d of %d cells, %d dates" % (num_points, lats.size, len(dates)))
-    del displacement
+    if coherence is None:
+        print("temporal coherence: none in the file, so the points have no coherence")
+    elif "coherence" in points_bundle.read_manifest(output_folder)["attributes"]:
+        print("temporal coherence: kept as the points' attribute coherence")
+    else:
+        print("temporal coherence: no point has a value, so the points have no coherence")
+    del displacement, coherence
 
     if like_csv:
         attributes["collection"] = "hdfeos5"
@@ -502,10 +529,10 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the command-line argument parser for insarmaps_ingester.py."""
     example_text = """\
 This program writes the dataset's points as arrays (points.json, p.npy, lon.npy,
-lat.npy, m.npy, d.npy and attr_NAME.npy for a CSV's quality columns) and
-metadata.pickle. json_mbtiles2insarmaps.py uploads them and builds the dataset's
-recolor store, from which the map draws it. A file whose name ends in .csv is read
-as a CSV, any other as HDF-EOS5.
+lat.npy, m.npy, d.npy, and attr_NAME.npy for a CSV's quality columns and an
+HDF-EOS5 file's temporal coherence) and metadata.pickle. json_mbtiles2insarmaps.py
+uploads them and builds the dataset's recolor store, from which the map draws it.
+A file whose name ends in .csv is read as a CSV, any other as HDF-EOS5.
 
 Examples:
   insarmaps_ingester.py mintpy/S1_IW1_128_0596_0597_20160605_XXXXXXXX_S00887_S00783_W091208_W091105.he5 mintpy/JSON

@@ -18,9 +18,9 @@ The below install instructions have been tested on ubuntu 22.04. Installing on W
 
 `insarmaps_ingester.py FILE DIR` writes the dataset in FILE, a CSV when its name ends in `.csv` and an HDF-EOS5 file
 (`.he5`) otherwise, to DIR as its points, numpy arrays (`points_bundle.py`: `points.json`, `p.npy`, `lon.npy`,
-`lat.npy`, `m.npy`, `d.npy`, and `attr_NAME.npy` for a CSV's quality columns; insarmaps `docs/recolor-store.md`
-section 12), and `metadata.pickle`. It reads the input once and writes no JSON and no `.mbtiles`; files of an earlier
-run in DIR are replaced. `--num-workers` is accepted and not needed.
+`lat.npy`, `m.npy`, `d.npy`, and `attr_NAME.npy` for a CSV's quality columns and an HDF-EOS5 file's temporal
+coherence; insarmaps `docs/recolor-store.md` section 12), and `metadata.pickle`. It reads the input once and writes
+no JSON and no `.mbtiles`; files of an earlier run in DIR are replaced. `--num-workers` is accepted and not needed.
 
 It replaces `hdfeos5_2json_mbtiles.py`, which minsar ran for an HDF-EOS5 file, and `hdfeos5_or_csv_2json_mbtiles.py`,
 which it ran for a CSV, and writes the same points and metadata for each. A minsar that still calls those names stops
@@ -37,6 +37,15 @@ geographic grid). minsar doesn't use it.
 - `d` holds the input's values exactly: float32 from an HDF-EOS5 file, float64 from a CSV (mm converted to m).
 - A CSV's quality columns keep their order; `point_ID` is an integer column when its values are whole numbers that fit
   int32; a missing quality value is NaN, and NULL in the point table.
+- An HDF-EOS5 file's temporal coherence (`HDFEOS/GRIDS/timeseries/quality/temporalCoherence`) becomes the points'
+  attribute `coherence`, the name a CSV's `coherence` or `temporal_coherence` column gets: a `double precision` column
+  of the point table, and an attribute of the dataset's recolor store, from which the map's Min Coherence slider reads
+  it. Each point has its cell's value as the file holds it (NaN, and NULL in the table, where the cell has none), with
+  either numbering. It is left out when the file has no such layer (or one of another shape than the grid) or none of
+  the points has a value in it, as in the horizontal and vertical decompositions, whose layer is all NaN. The file's
+  `mask` is still applied, and it is mostly a temporal coherence threshold of its own (MintPy's `minTempCoh`), so the
+  points' coherence starts at that threshold. An HDF-EOS5 dataset ingested by an older step 1 has no coherence until
+  it is ingested again.
 - A point without a finite position stops step 1 with a message saying which row.
 
 ## Uploading a dataset: json_mbtiles2insarmaps.py

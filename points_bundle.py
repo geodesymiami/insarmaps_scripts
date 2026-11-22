@@ -12,9 +12,10 @@ from it. Beside metadata.pickle:
     lon.npy, lat.npy  float64 (P,): the position, in degrees (EPSG:4326)
     m.npy             float64 (P,): the velocity, m/yr: the least-squares slope over the dates with a value
     d.npy             float32 or float64 (P, N): the displacement, m, one value per date; NaN where missing
-    attr_NAME.npy     float64 (P,): optional per-point columns (a CSV's quality columns), one file each, in the
-                      order of "attributes"; "attribute_types" gives each one's column type in the point table
-                      (integer for a column of whole numbers that fit int32, as ogr2ogr typed them)
+    attr_NAME.npy     float64 (P,): optional per-point columns (a CSV's quality columns, an HDF-EOS5 file's
+                      temporal coherence), one file each, in the order of "attributes", NaN where missing;
+                      "attribute_types" gives each one's column type in the point table (integer for a column of
+                      whole numbers that fit int32, as ogr2ogr typed them)
 
 points.json is written last: a folder without it is incomplete.
 
@@ -88,12 +89,24 @@ def grid_points(disp, block=BLOCK, numbering="blocks"):
     return idx, p.astype(np.int32)
 
 
-def write_grid_points(folder, disp, lats, lons, decimal_dates, numbering="blocks"):
+def write_grid_points(folder, disp, lats, lons, decimal_dates, numbering="blocks", attributes=None):
     """Writes the points of a gridded dataset to folder: disp (N, rows, cols) as read from the file, with NaN where
-    masked or missing; lats, lons (rows, cols). d keeps disp's dtype (float32 for HDF-EOS5). Returns P."""
+    masked or missing; lats, lons (rows, cols). d keeps disp's dtype (float32 for HDF-EOS5). attributes {NAME: (rows,
+    cols)}, or None: values per cell, such as an HDF-EOS5 file's temporal coherence, that become the points' attribute
+    columns (double precision, in this order): each point gets its cell's value, NaN where the cell has none. One that
+    has no finite value at any point is left out, like the all-NaN temporal coherence of a horizontal or vertical
+    decomposition: a column without a value would hide every point from a mask on it. Returns P."""
     idx, p = grid_points(disp, numbering=numbering)
     if len(idx) == 0:
         raise PointsError("no cell has values at two dates or more")
+    point_attributes = {}
+    for name, grid in (attributes or {}).items():
+        grid = np.asarray(grid)
+        if grid.shape != disp.shape[1:]:
+            raise PointsError("attribute %s is %s, the grid %s" % (name, grid.shape, disp.shape[1:]))
+        values = grid.reshape(-1)[idx].astype(np.float64)
+        if np.isfinite(values).any():
+            point_attributes[name] = values
     flat = disp.reshape(disp.shape[0], -1)
     lon = np.asarray(lons, dtype=np.float64).reshape(-1)[idx]
     lat = np.asarray(lats, dtype=np.float64).reshape(-1)[idx]
@@ -105,7 +118,7 @@ def write_grid_points(folder, disp, lats, lons, decimal_dates, numbering="blocks
         d[c0:c0 + FIT_CHUNK] = flat[:, idx[c0:c0 + FIT_CHUNK]].T
     m = fit_velocities(decimal_dates, d)
     d.flush()
-    _finish(folder, p, lon, lat, m, d, {})
+    _finish(folder, p, lon, lat, m, d, point_attributes)
     del d
     return len(p)
 
@@ -202,13 +215,18 @@ def has_points(folder):
     return os.path.isfile(os.path.join(folder, MANIFEST))
 
 
-def read_points(folder, mmap=True):
-    """The points of folder: (manifest, p, lon, lat, m, d, attributes), checked. Memory-mapped unless mmap=False."""
+def read_manifest(folder):
+    """folder's points.json as written, not checked against the arrays (read_points checks them)."""
     path = os.path.join(folder, MANIFEST)
     if not os.path.isfile(path):
         raise PointsError("no %s in %s" % (MANIFEST, folder))
     with open(path) as f:
-        manifest = json.load(f)
+        return json.load(f)
+
+
+def read_points(folder, mmap=True):
+    """The points of folder: (manifest, p, lon, lat, m, d, attributes), checked. Memory-mapped unless mmap=False."""
+    manifest = read_manifest(folder)
     mode = "r" if mmap else None
     arrays = {}
     for name in ARRAYS:
