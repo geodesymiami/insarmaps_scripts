@@ -37,7 +37,9 @@ import points_bundle
 LAT_CANDIDATES = ["Y_geocorr", "Latitude", "latitude", "Y", "ycoord"]
 LON_CANDIDATES = ["X_geocorr", "Longitude", "longitude", "X", "xcoord"]
 
-# The attributes that go into the dataset's area row (attribute_keys/attribute_values) and its extra_attributes
+# The attributes that go into the dataset's area row (attribute_keys/attribute_values) and its extra_attributes.
+# maskVminSim: the phase similarity threshold of the mask minsar's dolphin2he5.py gave an OPERA DISP-S1 or dolphin
+# file (0.4 for OPERA's recommended mask), where the map's Min Phase Similarity slider starts
 NEEDED_ATTRIBUTES = frozenset({
     "prf", "first_date", "mission", "WIDTH", "X_STEP", "processing_software",
     "wavelength", "processing_type", "beam_swath", "Y_FIRST", "look_direction",
@@ -45,12 +47,19 @@ NEEDED_ATTRIBUTES = frozenset({
     "unwrap_method", "relative_orbit", "beam_mode", "LENGTH", "max_baseline_perp",
     "X_FIRST", "atmos_correct_method", "last_date", "first_frame", "frame", "Y_STEP", "history",
     "scene_footprint", "data_footprint", "downloadUnavcoUrl", "referencePdfUrl", "areaName", "referenceText",
-    "REF_LAT", "REF_LON", "CENTER_LINE_UTC", "insarmaps_download_flag", "mintpy.subset.lalo",
+    "REF_LAT", "REF_LON", "CENTER_LINE_UTC", "insarmaps_download_flag", "mintpy.subset.lalo", "maskVminSim",
 })
 # hdfeos5_2json_mbtiles.py's list lacked a comma between these two, which made them one name that no attribute has,
 # so no HDF-EOS5 dataset got them (MintPy files carry unwrap_method = Unknown). An .he5 still leaves them out.
 NOT_FROM_HDFEOS5 = frozenset({"min_baseline_perp", "unwrap_method"})
 GRID_ATTRIBUTES = ("X_STEP", "Y_STEP", "X_FIRST", "Y_FIRST")
+# An HDF-EOS5 file's cells whose phase similarity (quality/phaseSimilarity, which OPERA DISP-S1 and dolphin files have)
+# is below this become no point (--min-phase-similarity); the map's Min Phase Similarity slider can hide more
+MIN_PHASE_SIMILARITY = 0.2
+# the per-cell layers an HDF-EOS5 file's points keep as their attributes: (attribute, layer in
+# HDFEOS/GRIDS/timeseries/quality, what it is), in the point table's column order
+QUALITY_ATTRIBUTES = (("coherence", "temporalCoherence", "temporal coherence"),
+                      ("phaseSimilarity", "phaseSimilarity", "phase similarity"))
 
 
 # ---------------------------------------------------------------------------------------
@@ -163,45 +172,71 @@ def read_from_hdfeos5_file(file_name):
     return dict(he_obj.metadata), he_obj.dateList, displacement, lats, lons
 
 
-def read_temporal_coherence(file_name, shape):
-    """The file's temporal coherence (HDFEOS/GRIDS/timeseries/quality/temporalCoherence), one value per cell of the
-    grid (shape: rows, cols), as the file holds it; None when the file has no such layer, or one of another shape. The
-    file's mask, applied to the displacement, is mostly a temporal coherence threshold of its own (MintPy's
-    minTempCoh), so the points' coherence starts there."""
+def read_quality_layer(file_name, name, shape):
+    """The file's layer HDFEOS/GRIDS/timeseries/quality/NAME (temporalCoherence, phaseSimilarity), one value per cell
+    of the grid (shape: rows, cols), as the file holds it; None when the file has no such layer, or one of another
+    shape. The file's own mask, applied to the displacement, has left cells out already: MintPy's is a temporal
+    coherence threshold (minTempCoh), so the points' coherence starts there; OPERA's recommended one keeps a cell
+    whose temporal coherence is at least 0.6 or whose phase similarity is at least 0.4."""
     with h5py.File(file_name, "r") as f:
-        layer = f.get("HDFEOS/GRIDS/timeseries/quality/temporalCoherence")
+        layer = f.get("HDFEOS/GRIDS/timeseries/quality/" + name)
         if not isinstance(layer, h5py.Dataset):
             return None
         if layer.shape != tuple(shape):
-            print("temporalCoherence is %s, not the grid's %s: left out" % (layer.shape, tuple(shape)))
+            print("%s is %s, not the grid's %s: left out" % (name, layer.shape, tuple(shape)))
             return None
         return layer[()]
 
 
-def convert_hdfeos5(file_name, output_folder, like_csv=False):
+def drop_low_phase_similarity(displacement, similarity, minimum):
+    """Masks the cells whose phase similarity is below minimum (NaN in displacement, in place), so that they become no
+    point. The comparison is the map's (float32, both sides rounded); a cell without a value is kept, as OPERA's
+    recommended mask keeps one. Returns how many of those cells would have been points (values at two dates or more)."""
+    low = np.asarray(similarity, dtype=np.float32) < np.float32(minimum)      # False for NaN
+    if not low.any():
+        return 0
+    values = np.zeros(int(low.sum()), dtype=np.int32)
+    for k in range(displacement.shape[0]):           # one date at a time: no copy of the low cells' whole series
+        date = displacement[k]                       # a view
+        values += np.isfinite(date[low])
+        date[low] = np.nan
+    return int((values >= 2).sum())
+
+
+def convert_hdfeos5(file_name, output_folder, like_csv=False, min_phase_similarity=MIN_PHASE_SIMILARITY):
     """Writes an HDF-EOS5 file's points and metadata.pickle as hdfeos5_2json_mbtiles.py did or, with like_csv, as
     hdfeos5_or_csv_2json_mbtiles.py did: each cell numbered by its flat index, and the metadata a CSV gets. Either
-    way the points get the file's temporal coherence as their attribute coherence, when the file has one."""
+    way the points get the file's temporal coherence as their attribute coherence and its phase similarity as their
+    attribute phaseSimilarity, when the file has them, and a cell whose phase similarity is below
+    min_phase_similarity becomes no point."""
     attributes, dates, displacement, lats, lons = read_from_hdfeos5_file(file_name)
-    coherence = read_temporal_coherence(file_name, displacement.shape[1:])
+    layers = {name: read_quality_layer(file_name, layer, displacement.shape[1:])
+              for name, layer, _ in QUALITY_ATTRIBUTES}
     decimal_dates = [get_decimal_date(get_date(d)) for d in dates]
+    if layers["phaseSimilarity"] is not None:
+        dropped = drop_low_phase_similarity(displacement, layers["phaseSimilarity"], min_phase_similarity)
+        print("phase similarity: %d points below %g left out" % (dropped, min_phase_similarity))
 
     # every cell with values at two dates or more, its velocity fitted over the dates it has, numbered from the first
     # cell of each block of 20,000 cells or, like_csv, by its flat index (row * WIDTH + col). Its temporal coherence
-    # becomes its attribute coherence, the name a CSV's coherence column gets, which the map's Min Coherence slider
-    # reads from the dataset's recolor store; left out when no point has a value (a horizontal or vertical
-    # decomposition's layer is all NaN)
+    # becomes its attribute coherence, the name a CSV's coherence column gets, and its phase similarity its attribute
+    # phaseSimilarity, which the map's Min Coherence and Min Phase Similarity sliders read from the dataset's recolor
+    # store; each is left out when no point has a value (a horizontal or vertical decomposition's temporal coherence
+    # is all NaN)
+    present = {name: grid for name, grid in layers.items() if grid is not None}
     num_points = points_bundle.write_grid_points(output_folder, displacement, lats, lons, decimal_dates,
                                                  numbering="flat" if like_csv else "blocks",
-                                                 attributes=None if coherence is None else {"coherence": coherence})
+                                                 attributes=present or None)
     print("points: %d of %d cells, %d dates" % (num_points, lats.size, len(dates)))
-    if coherence is None:
-        print("temporal coherence: none in the file, so the points have no coherence")
-    elif "coherence" in points_bundle.read_manifest(output_folder)["attributes"]:
-        print("temporal coherence: kept as the points' attribute coherence")
-    else:
-        print("temporal coherence: no point has a value, so the points have no coherence")
-    del displacement, coherence
+    kept = points_bundle.read_manifest(output_folder)["attributes"]
+    for name, _, what in QUALITY_ATTRIBUTES:
+        if layers[name] is None:
+            print("%s: none in the file, so the points have no %s" % (what, name))
+        elif name in kept:
+            print("%s: kept as the points' attribute %s" % (what, name))
+        else:
+            print("%s: no point has a value, so the points have no %s" % (what, name))
+    del displacement, layers, present
 
     if like_csv:
         attributes["collection"] = "hdfeos5"
@@ -530,9 +565,10 @@ def build_parser() -> argparse.ArgumentParser:
     example_text = """\
 This program writes the dataset's points as arrays (points.json, p.npy, lon.npy,
 lat.npy, m.npy, d.npy, and attr_NAME.npy for a CSV's quality columns and an
-HDF-EOS5 file's temporal coherence) and metadata.pickle. json_mbtiles2insarmaps.py
-uploads them and builds the dataset's recolor store, from which the map draws it.
-A file whose name ends in .csv is read as a CSV, any other as HDF-EOS5.
+HDF-EOS5 file's temporal coherence and phase similarity) and metadata.pickle.
+json_mbtiles2insarmaps.py uploads them and builds the dataset's recolor store, from
+which the map draws it. A file whose name ends in .csv is read as a CSV, any other
+as HDF-EOS5.
 
 Examples:
   insarmaps_ingester.py mintpy/S1_IW1_128_0596_0597_20160605_XXXXXXXX_S00887_S00783_W091208_W091105.he5 mintpy/JSON
@@ -563,6 +599,16 @@ Examples:
              "and dem). Without it, an HDF-EOS5 file gets what hdfeos5_2json_mbtiles.py wrote, as minsar\n"
              "uses. No effect on a CSV.",
     )
+    parser.add_argument(
+        "--min-phase-similarity",
+        type=float,
+        default=MIN_PHASE_SIMILARITY,
+        metavar="V",
+        help="For an HDF-EOS5 file with a phase similarity (quality/phaseSimilarity: OPERA DISP-S1, dolphin),\n"
+             "leave out the cells whose phase similarity is below V (default %(default)s; -1 keeps them all).\n"
+             "The points keep theirs as the attribute phaseSimilarity, from which the map's Min Phase\n"
+             "Similarity slider hides more. No effect on a CSV or a file without the layer.",
+    )
 
     required = parser.add_argument_group("required arguments")
     required.add_argument("file", help="(unavco) Input file to ingest (.he5 or .csv).")
@@ -586,7 +632,8 @@ def main():
     if Path(args.file).suffix.lower() == ".csv":
         convert_csv(args.file, args.outputDir)
     else:
-        convert_hdfeos5(args.file, args.outputDir, like_csv=args.he5_like_csv)
+        convert_hdfeos5(args.file, args.outputDir, like_csv=args.he5_like_csv,
+                        min_phase_similarity=args.min_phase_similarity)
 
     print("time elapsed: " + str(time.perf_counter() - start_time))
 

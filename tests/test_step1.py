@@ -37,6 +37,14 @@ CELLS = [k for k in range(12) if k != 1]            # write_he5's 12 cells but (
 COHERENCE = np.array([[0.91, 0.32, 0.88, 0.97],
                       [0.75, 0.62, np.nan, 0.99],
                       [0.58, 0.83, 0.95, 0.71]], dtype=np.float32) if ingester else None
+# a phaseSimilarity layer for write_he5, as minsar's dolphin2he5.py writes one for an OPERA DISP-S1 file: below the
+# ingest's floor of 0.2 at the points (0, 3) and (2, 0), and at (2, 2) the float32 just under float32(0.2); on it at
+# (1, 0), which stays; NaN at the point (1, 3), which stays too; low at the masked cell (0, 1), no point anyway
+SIMILARITY = np.array([[0.90, 0.05, 0.85, 0.10],
+                       [0.2, 0.55, 0.47, np.nan],
+                       [0.15, 0.93, np.nextafter(np.float32(0.2), np.float32(0)), 0.99]],
+                      dtype=np.float32) if ingester else None
+ABOVE_FLOOR = [0, 2, 4, 5, 6, 7, 9, 11]             # the cells that stay points with SIMILARITY and the floor 0.2
 
 
 def old_fit(t, y):
@@ -44,10 +52,10 @@ def old_fit(t, y):
     return np.linalg.lstsq(np.vstack([t, np.ones(len(t))]).T, y, rcond=None)[0][0]
 
 
-def write_he5(path, extra_attributes=None, coherence=None):
+def write_he5(path, extra_attributes=None, coherence=None, similarity=None):
     """An HDF-EOS5 file of 3 x 4 cells and 3 dates, as MintPy writes it, radar-coded (no X_STEP) unless
-    extra_attributes adds GRID: cell (0, 1) masked, cell (2, 3) missing at the last date; coherence, when given, is
-    its temporalCoherence layer, which it has none of otherwise."""
+    extra_attributes adds GRID: cell (0, 1) masked, cell (2, 3) missing at the last date; coherence and similarity,
+    when given, are its temporalCoherence and phaseSimilarity layers, which it has none of otherwise."""
     length, width = 3, 4
     disp = np.arange(len(DATES) * length * width, dtype=np.float32).reshape(len(DATES), length, width) / 1000
     disp[2, 2, 3] = np.nan
@@ -68,6 +76,8 @@ def write_he5(path, extra_attributes=None, coherence=None):
         g.create_dataset('quality/mask', data=mask)
         if coherence is not None:
             g.create_dataset('quality/temporalCoherence', data=coherence)
+        if similarity is not None:
+            g.create_dataset('quality/phaseSimilarity', data=similarity)
         g.create_dataset('geometry/latitude', data=lat.astype(np.float32))
         g.create_dataset('geometry/longitude', data=lon.astype(np.float32))
     return disp, lat.astype(np.float32), lon.astype(np.float32)
@@ -115,6 +125,8 @@ class Step1(unittest.TestCase):
         if coherence is None:
             self.assertEqual(attrs, {})
             self.assertIn('temporal coherence: none in the file', self.printed)
+        self.assertIn('phase similarity: none in the file, so the points have no phaseSimilarity', self.printed)
+        self.assertNotIn('points below', self.printed)                     # the floor's line: no layer, no floor
         return list(p), meta, lat, lon
 
     def check_like_hdfeos5_2json_mbtiles(self, p, meta):
@@ -195,6 +207,91 @@ class Step1(unittest.TestCase):
                 self.assertEqual(p, list(range(11)))
                 self.assertEqual((self.manifest['attributes'], self.attrs), ([], {}))
                 self.assertIn(message, self.printed)
+
+    def run_similarity(self, options=(), coherence=COHERENCE, similarity=SIMILARITY, extra_attributes=None):
+        """Runs the script on write_he5's file with a phaseSimilarity layer: the points' cells (by their flat index,
+        from --he5-like-csv's p), the points' attributes and the metadata."""
+        he5 = os.path.join(self.dir, 'S1_asc_048_dispS1_20200101_20200125.he5')
+        write_he5(he5, dict(GRID, **(extra_attributes or {})), coherence, similarity)
+        (manifest, p, _, _, _, d, attrs), meta = self.run_script([he5, os.path.join(self.dir, 'JSON'),
+                                                                   '--he5-like-csv', *options])
+        self.manifest = manifest
+        return list(p), attrs, meta
+
+    def test_he5_phase_similarity_below_the_floor_is_no_point(self):
+        """A cell whose phaseSimilarity is below 0.2, compared in float32 as the map compares, becomes no point;
+        one on the floor or without a value stays. The others keep theirs as the attribute phaseSimilarity, after
+        coherence, with either numbering."""
+        p, attrs, meta = self.run_similarity()
+        self.assertEqual(p, ABOVE_FLOOR)
+        self.assertEqual(self.manifest['attributes'], ['coherence', 'phaseSimilarity'])
+        self.assertEqual(self.manifest['attribute_types'], {'coherence': 'double precision',
+                                                            'phaseSimilarity': 'double precision'})
+        np.testing.assert_array_equal(attrs['phaseSimilarity'],
+                                      SIMILARITY.reshape(-1)[ABOVE_FLOOR].astype(np.float64))
+        np.testing.assert_array_equal(attrs['coherence'], COHERENCE.reshape(-1)[ABOVE_FLOOR].astype(np.float64))
+        self.assertTrue(math.isnan(attrs['phaseSimilarity'][ABOVE_FLOOR.index(7)]))      # cell (1, 3)
+        self.assertEqual(attrs['phaseSimilarity'][ABOVE_FLOOR.index(4)], float(np.float32(0.2)))
+        self.assertIn('phase similarity: 3 points below 0.2 left out', self.printed)
+        self.assertIn('phase similarity: kept as the points\' attribute phaseSimilarity', self.printed)
+        self.assertNotIn('phaseSimilarity', meta['attribute_keys'])     # a point's value, not the dataset's
+
+        # the default numbering counts the points that stay
+        he5 = os.path.join(self.dir, 'S1_asc_048_dispS1_20200101_20200125.he5')
+        (manifest, p, _, _, _, _, attrs), _ = self.run_script([he5, os.path.join(self.dir, 'JSON')])
+        self.assertEqual(list(p), list(range(len(ABOVE_FLOOR))))
+        np.testing.assert_array_equal(attrs['phaseSimilarity'],
+                                      SIMILARITY.reshape(-1)[ABOVE_FLOOR].astype(np.float64))
+
+    def test_he5_min_phase_similarity_chooses_the_floor(self):
+        for options, cells, dropped in ((('--min-phase-similarity', '-1'), CELLS, 0),
+                                        (('--min-phase-similarity', '0.5'), [0, 2, 5, 7, 9, 11], 5),
+                                        (('--min-phase-similarity', '0.2'), ABOVE_FLOOR, 3)):
+            with self.subTest(options=options):
+                p, attrs, _ = self.run_similarity(options)
+                self.assertEqual(p, cells)
+                np.testing.assert_array_equal(attrs['phaseSimilarity'],
+                                              SIMILARITY.reshape(-1)[cells].astype(np.float64))
+                self.assertIn('phase similarity: %d points below %s left out' % (dropped, options[1]), self.printed)
+
+    def test_he5_phase_similarity_floor_compares_in_float32(self):
+        """In a float64 layer, a value a little under 0.2 that float32 rounds onto float32(0.2) stays, as the map's
+        mask at 0.20 keeps it; a float64 comparison would leave it out."""
+        similarity = SIMILARITY.astype(np.float64)
+        similarity[1, 0] = 0.2 - 1e-12
+        self.assertEqual(np.float32(similarity[1, 0]), np.float32(0.2))
+        p, attrs, _ = self.run_similarity(similarity=similarity)
+        self.assertEqual(p, ABOVE_FLOOR)
+        self.assertEqual(attrs['phaseSimilarity'][ABOVE_FLOOR.index(4)], 0.2 - 1e-12)
+
+    def test_he5_without_a_phase_similarity_value_has_no_floor_and_no_attribute(self):
+        """An all-NaN phaseSimilarity layer leaves out no cell and gives the points no phaseSimilarity; a file
+        with phaseSimilarity and no temporalCoherence gets phaseSimilarity alone."""
+        p, attrs, _ = self.run_similarity(similarity=np.full((3, 4), np.nan, dtype=np.float32))
+        self.assertEqual(p, CELLS)
+        self.assertEqual(self.manifest['attributes'], ['coherence'])
+        self.assertIn('phase similarity: 0 points below 0.2 left out', self.printed)
+        self.assertIn('phase similarity: no point has a value, so the points have no phaseSimilarity', self.printed)
+
+        p, attrs, _ = self.run_similarity(coherence=None)
+        self.assertEqual(p, ABOVE_FLOOR)
+        self.assertEqual(self.manifest['attributes'], ['phaseSimilarity'])
+        self.assertIn('temporal coherence: none in the file, so the points have no coherence', self.printed)
+
+    def test_he5_mask_vmin_sim_is_an_attribute_of_the_dataset(self):
+        """maskVminSim, the phase similarity threshold of the file's own mask (minsar's dolphin2he5.py), goes into
+        the area row and extra_attributes, where the map's Min Phase Similarity slider starts; the mask's other
+        provenance attributes don't."""
+        mask = {'maskSource': 'recommended', 'maskVmin': '0.6', 'maskVminSim': '0.4'}
+        for options in ((), ('--he5-like-csv',)):
+            with self.subTest(options=options):
+                he5 = os.path.join(self.dir, 'S1_asc_048_dispS1_20200101_20200125.he5')
+                write_he5(he5, dict(GRID, **mask), COHERENCE, SIMILARITY)
+                _, meta = self.run_script([he5, os.path.join(self.dir, 'JSON'), *options])
+                k = meta['attribute_keys'].index('maskVminSim')
+                self.assertEqual(meta['attribute_values'][k], '0.4')
+                self.assertIn('maskVminSim', meta['needed_attributes'])
+                self.assertFalse({'maskSource', 'maskVmin'} & set(meta['attribute_keys']))
 
     def test_csv(self):
         csv = os.path.join(self.dir, 'TSX_036_20200101_20200125_N2579W08019.csv')

@@ -13,7 +13,8 @@ from it. Beside metadata.pickle:
     m.npy             float64 (P,): the velocity, m/yr: the least-squares slope over the dates with a value
     d.npy             float32 or float64 (P, N): the displacement, m, one value per date; NaN where missing
     attr_NAME.npy     float64 (P,): optional per-point columns (a CSV's quality columns, an HDF-EOS5 file's
-                      temporal coherence), one file each, in the order of "attributes", NaN where missing;
+                      temporal coherence and phase similarity), one file each, in the order of "attributes", NaN
+                      where missing;
                       "attribute_types" gives each one's column type in the point table (integer for a column of
                       whole numbers that fit int32, as ogr2ogr typed them)
 
