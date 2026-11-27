@@ -19,8 +19,9 @@ The below install instructions have been tested on ubuntu 22.04. Installing on W
 `insarmaps_ingester.py FILE DIR` writes the dataset in FILE, a CSV when its name ends in `.csv` and an HDF-EOS5 file
 (`.he5`) otherwise, to DIR as its points, numpy arrays (`points_bundle.py`: `points.json`, `p.npy`, `lon.npy`,
 `lat.npy`, `m.npy`, `d.npy`, and `attr_NAME.npy` for a CSV's quality columns and an HDF-EOS5 file's temporal
-coherence; insarmaps `docs/recolor-store.md` section 12), and `metadata.pickle`. It reads the input once and writes
-no JSON and no `.mbtiles`; files of an earlier run in DIR are replaced. `--num-workers` is accepted and not needed.
+coherence and phase similarity; insarmaps `docs/recolor-store.md` section 12), and `metadata.pickle`. It reads the
+input once and writes no JSON and no `.mbtiles`; files of an earlier run in DIR are replaced. `--num-workers` is
+accepted and not needed.
 
 It replaces `hdfeos5_2json_mbtiles.py`, which minsar ran for an HDF-EOS5 file, and `hdfeos5_or_csv_2json_mbtiles.py`,
 which it ran for a CSV, and writes the same points and metadata for each. A minsar that still calls those names stops
@@ -46,6 +47,14 @@ geographic grid). minsar doesn't use it.
   `mask` is still applied, and it is mostly a temporal coherence threshold of its own (MintPy's `minTempCoh`), so the
   points' coherence starts at that threshold. An HDF-EOS5 dataset ingested by an older step 1 has no coherence until
   it is ingested again.
+- An HDF-EOS5 file's phase similarity (`HDFEOS/GRIDS/timeseries/quality/phaseSimilarity`, which the OPERA DISP-S1 and
+  dolphin files that minsar's `dolphin2he5.py` writes have) becomes the points' attribute `phaseSimilarity` the same
+  way, after `coherence`; the map's Min Phase Similarity slider reads it. A cell whose phase similarity is below 0.2
+  becomes no point, compared in float32 as the map compares (`--min-phase-similarity V` sets another floor; `-1`
+  keeps every cell); a cell without a value stays, as OPERA's recommended mask keeps one. On the Miami DISP-S1 file
+  of insarmaps issue #222 (112,042 points before), the floor left out 133. The file's `maskVminSim`, the phase
+  similarity threshold of its own mask (0.4 for OPERA's recommended mask), goes into the dataset's attributes, where
+  the slider starts.
 - A point without a finite position stops step 1 with a message saying which row.
 
 ## Uploading a dataset: json_mbtiles2insarmaps.py
